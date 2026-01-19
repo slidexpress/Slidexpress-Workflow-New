@@ -3213,8 +3213,26 @@ const DeadlinePickerModal = ({ ticket, onClose, onSave }) => {
 };
 
 /* ===================== MAIN DASHBOARD ===================== */
+const TICKETS_CACHE_KEY = 'coordinatorDashboardTicketsCache';
+const TEAM_CACHE_KEY = 'coordinatorDashboardTeamCache';
+
 const CoordinatorDashboardHome = () => {
-  const [tickets, setTickets] = useState([]);
+  // ⚡ INSTANT LOAD: Initialize from localStorage cache
+  const [tickets, setTickets] = useState(() => {
+    try {
+      const cached = localStorage.getItem(TICKETS_CACHE_KEY);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        console.log(`⚡ INSTANT: Loaded ${parsed.length} cached tickets`);
+        return parsed;
+      }
+    } catch (e) {
+      console.warn('Failed to load cached tickets:', e);
+    }
+    return [];
+  });
+  const [isInitialLoading, setIsInitialLoading] = useState(true); // Shows skeleton on first load only
+  const [isEmailSyncing, setIsEmailSyncing] = useState(false); // Separate indicator for email sync
   const [toast, setToast] = useState(null);
   const [showEmailModal, setShowEmailModal] = useState(false);
   const [selectedJobId, setSelectedJobId] = useState(null);
@@ -3410,25 +3428,31 @@ const CoordinatorDashboardHome = () => {
 
   /* ======== SYNC EMAILS FROM GMAIL ======== */
   const syncEmails = async () => {
+    // ⚡ NON-BLOCKING: Show indicator but don't block UI
+    setIsEmailSyncing(true);
     try {
       console.log('📧 Syncing starred emails from Gmail...');
       const startTime = Date.now();
       const res = await emailAPI.syncEmails();
       const duration = Date.now() - startTime;
-      console.log(`✅ Email sync completed in ${duration}ms:`, res.data?.count || 0, 'emails,', res.data?.ticketsCreated || 0, 'new tickets');
+      console.log(`✅ Email sync completed in ${duration}ms:`, res.data?.emailsFetched || 0, 'emails,', res.data?.ticketsCreated || 0, 'new tickets');
 
       // Show toast only if new tickets were created
       if (res.data?.ticketsCreated > 0) {
         showToast(`${res.data.ticketsCreated} new ticket(s) created from Gmail`);
+        // Refresh tickets to show new ones
+        fetchTickets(false, false);
       }
     } catch (error) {
       console.error('❌ Error syncing emails:', error);
       // Don't show toast for auto-sync errors to avoid interrupting user
+    } finally {
+      setIsEmailSyncing(false);
     }
   };
 
   /* ======== FETCH TICKETS ======== */
-  const fetchTickets = async (showSyncIndicator = false) => {
+  const fetchTickets = async (showSyncIndicator = false, isInitial = false) => {
     try {
       if (showSyncIndicator) {
         setIsSyncing(true);
@@ -3442,12 +3466,20 @@ const CoordinatorDashboardHome = () => {
       const res = await ticketAPI.getAllTickets();
       console.timeEnd('1️⃣ API Request');
 
-      const tickets = res.data?.tickets || [];
-      console.log(`✅ Received ${tickets.length} tickets from API`);
+      const fetchedTickets = res.data?.tickets || [];
+      console.log(`✅ Received ${fetchedTickets.length} tickets from API`);
 
       console.time('2️⃣ Setting state');
-      setTickets(tickets);
+      setTickets(fetchedTickets);
       console.timeEnd('2️⃣ Setting state');
+
+      // ⚡ CACHE: Save to localStorage for instant load on refresh
+      try {
+        localStorage.setItem(TICKETS_CACHE_KEY, JSON.stringify(fetchedTickets));
+        console.log(`💾 Cached ${fetchedTickets.length} tickets to localStorage`);
+      } catch (e) {
+        console.warn('Failed to cache tickets:', e);
+      }
 
       const totalTime = performance.now() - startTime;
       console.log(`⚡ TOTAL TIME: ${totalTime.toFixed(0)}ms`);
@@ -3466,6 +3498,10 @@ const CoordinatorDashboardHome = () => {
     } finally {
       if (showSyncIndicator) {
         setIsSyncing(false);
+      }
+      // Mark initial loading as complete
+      if (isInitial) {
+        setIsInitialLoading(false);
       }
     }
   };
@@ -3494,36 +3530,45 @@ const CoordinatorDashboardHome = () => {
     }
   };
 
-  // ⚡ INSTANT PAGE LOAD: Fetch tickets first (fast), then sync emails in background
+  // ⚡ INSTANT PAGE LOAD: Show cached data immediately, fetch fresh data in background
   useEffect(() => {
-    // Initial load - fetch tickets and team members FIRST (fast, from DB)
-    // Then sync emails in background (slow, IMAP connection)
-    fetchTickets(false);
+    // Check if we have cached data - if yes, page is already usable!
+    const hasCachedData = tickets.length > 0;
+
+    if (hasCachedData) {
+      console.log('⚡ INSTANT: Page ready with cached data, fetching fresh data in background...');
+      setIsInitialLoading(false); // Page is immediately usable
+    }
+
+    // Fetch fresh tickets and team members (fast, from DB)
+    fetchTickets(false, !hasCachedData); // Only mark as initial if no cache
     fetchTeamMembers();
 
-    // Delay email sync slightly to let UI render first
-    setTimeout(() => {
+    // ⚡ EMAIL SYNC: Start in background after a brief delay (doesn't block UI)
+    // The UI is already interactive at this point
+    const emailSyncTimeout = setTimeout(() => {
       syncEmails();
-    }, 500);
+    }, 1000); // 1 second delay to ensure UI is fully rendered
 
-    // 🔄 AUTO-REFRESH: Poll every 60 seconds (not 10s - email sync takes 15-30s)
+    // 🔄 AUTO-REFRESH: Poll every 60 seconds
     const refreshInterval = setInterval(() => {
       console.log('🔄 Auto-refreshing tickets...');
-      fetchTickets(false); // Just refresh tickets (fast)
-    }, 60000); // 60 seconds - prevents overlapping slow syncs
+      fetchTickets(false, false);
+    }, 60000);
 
     // Separate slower email sync every 2 minutes
     const emailSyncInterval = setInterval(() => {
       console.log('🔄 Background email sync...');
       syncEmails();
-    }, 120000); // 2 minutes
+    }, 120000);
 
     // Cleanup intervals on component unmount
     return () => {
+      clearTimeout(emailSyncTimeout);
       clearInterval(refreshInterval);
       clearInterval(emailSyncInterval);
     };
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const showToast = (msg) => {
     setToast(msg);
@@ -4668,33 +4713,59 @@ const CoordinatorDashboardHome = () => {
     }
   };
 
+  // ⚡ LOADING: Show spinner overlay on first load without cached data
+  if (isInitialLoading && tickets.length === 0) {
+    return (
+      <div className="flex flex-col h-screen p-2 bg-white text-[13px]">
+        <style>{hideScrollbarStyles}</style>
+        <div className="flex-1 flex items-center justify-center">
+          <div className="text-center">
+            <div className="inline-block animate-spin rounded-full h-8 w-8 border-4 border-blue-500 border-t-transparent mb-3"></div>
+            <p className="text-gray-600 text-sm">Loading dashboard...</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col h-screen p-2 bg-white text-[13px]">
       <style>{hideScrollbarStyles}</style>
 
       {/* Column Manager and Sync Indicator */}
       <div className="mb-3 flex justify-between items-center flex-shrink-0">
-        {/* Sync Indicator */}
+        {/* Sync Indicators */}
         <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2">
-            {isSyncing && (
-              <div className="flex items-center gap-2 text-blue-600 animate-pulse">
-                <div className="w-2 h-2 bg-blue-500 rounded-full"></div>
-                <span className="text-xs font-medium">Syncing...</span>
-              </div>
-            )}
-            {!isSyncing && lastSyncTime && (
-              <div className="flex items-center gap-2 text-gray-500">
-                <div className="w-2 h-2 bg-green-500 rounded-full"></div>
-                <span className="text-xs">
-                  Last synced: {new Date(lastSyncTime).toLocaleTimeString()}
-                </span>
-              </div>
-            )}
-            {!isSyncing && !lastSyncTime && (
-              <div className="flex items-center gap-2 text-gray-400">
-                <div className="w-2 h-2 bg-gray-400 rounded-full"></div>
-                <span className="text-xs">Auto-refresh enabled</span>
+          <div className="flex items-center gap-4">
+            {/* Ticket Sync Status */}
+            <div className="flex items-center gap-2">
+              {isSyncing && (
+                <div className="flex items-center gap-2 text-blue-600 animate-pulse">
+                  <div className="w-2 h-2 bg-blue-500 rounded-full"></div>
+                  <span className="text-xs font-medium">Syncing tickets...</span>
+                </div>
+              )}
+              {!isSyncing && lastSyncTime && (
+                <div className="flex items-center gap-2 text-gray-500">
+                  <div className="w-2 h-2 bg-green-500 rounded-full"></div>
+                  <span className="text-xs">
+                    Last synced: {new Date(lastSyncTime).toLocaleTimeString()}
+                  </span>
+                </div>
+              )}
+              {!isSyncing && !lastSyncTime && (
+                <div className="flex items-center gap-2 text-gray-400">
+                  <div className="w-2 h-2 bg-gray-400 rounded-full"></div>
+                  <span className="text-xs">Auto-refresh enabled</span>
+                </div>
+              )}
+            </div>
+
+            {/* Email Sync Indicator - Shows when Gmail sync is happening */}
+            {isEmailSyncing && (
+              <div className="flex items-center gap-2 text-purple-600 animate-pulse border-l border-gray-300 pl-4">
+                <Mail size={14} className="animate-bounce" />
+                <span className="text-xs font-medium">Checking Gmail...</span>
               </div>
             )}
           </div>
