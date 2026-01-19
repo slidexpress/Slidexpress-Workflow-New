@@ -2,6 +2,28 @@ import { useEffect, useState, useMemo } from 'react';
 import { Clock, User, Calendar } from 'lucide-react';
 import { ticketAPI, teamMemberAPI } from '../utils/api';
 import TicketDetailsModal from '../components/TicketDetailsModal';
+
+/* Light gray scrollbar styles */
+const scrollbarStyles = `
+  .availability-scroll::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .availability-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .availability-scroll::-webkit-scrollbar-thumb {
+    background: #d1d5db;
+    border-radius: 3px;
+  }
+  .availability-scroll::-webkit-scrollbar-thumb:hover {
+    background: #9ca3af;
+  }
+  .availability-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: #d1d5db transparent;
+  }
+`;
  
 const Availability = () => {
   const [loading, setLoading] = useState(true);
@@ -414,7 +436,8 @@ const Availability = () => {
   }
  
   return (
-    <div className="p-8 bg-gray-50 min-h-screen">
+    <div className="p-4 bg-gray-50 h-screen overflow-auto availability-scroll">
+      <style>{scrollbarStyles}</style>
       <div className="mb-3">
         <h1 className="text-xl font-bold text-gray-900">Team Availability</h1>
       </div>
@@ -431,7 +454,7 @@ const Availability = () => {
         ))}
       </div>
  
-      <div className="bg-white rounded-lg shadow-lg overflow-x-auto">
+      <div className="bg-white rounded-lg shadow-lg overflow-x-auto availability-scroll">
         {/* Timeline Header */}
         <div className="bg-gray-50 border-b-2 border-gray-300 py-1 px-2 border-l-4 border-l-transparent sticky top-0 z-10">
           <div className="flex items-center gap-2">
@@ -481,7 +504,7 @@ const Availability = () => {
         </div>
  
         {/* Gantt Chart Body */}
-        <div className="divide-y divide-gray-200 max-h-[80vh] overflow-y-auto">
+        <div className="divide-y divide-gray-200">
           {ganttData.length === 0 ? (
             <div className="p-16 text-center text-gray-500">
               <Clock className="w-20 h-20 mx-auto mb-4 text-gray-300" />
