@@ -23,7 +23,7 @@ const buildTransporter = (port, secure) => {
     secure, // true = SMTPS (465), false = STARTTLS (587)
     auth: {
       user,
-      pass: pass
+      pass: cleanedPassword
     },
     connectionTimeout: 10000, // 10s
     greetingTimeout: 10000,
