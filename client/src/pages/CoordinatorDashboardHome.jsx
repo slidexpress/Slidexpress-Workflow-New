@@ -108,28 +108,31 @@ const hideScrollbarStyles = `
 `;
 
 /* ===================== DEFAULT COLUMN CONFIGURATION ===================== */
+/* Columns in order: Job ID, Client, Consultant, Client Type, Deadline, TL, Team Member,
+   Status, Estimate Time, To Check, New, Edits, Proof read, Mail, Action */
 const DEFAULT_COLUMNS = [
   { id: 'jobId', label: 'Job ID', defaultVisible: true },
   { id: 'client', label: 'Client', defaultVisible: true },
-  { id: 'clientType', label: 'Client Type', defaultVisible: true },
   { id: 'consultant', label: 'Consultant', defaultVisible: true },
-  { id: 'toCheck', label: 'To Check', defaultVisible: true },
+  { id: 'clientType', label: 'Client Type', defaultVisible: true },
+  { id: 'deadline', label: 'Deadline', defaultVisible: true },
   { id: 'teamLead', label: 'TL', defaultVisible: true },
   { id: 'teamMember', label: 'Team Member', defaultVisible: true },
   { id: 'status', label: 'Status', defaultVisible: true },
   { id: 'estimate', label: 'Estimate Time', defaultVisible: true },
-  { id: 'timezone', label: 'Time Zone', defaultVisible: true },
-  { id: 'deadline', label: 'Deadline', defaultVisible: true },
-  { id: 'istTime', label: 'IST Time', defaultVisible: true },
-  { id: 'ticketTime', label: 'Ticket Time', defaultVisible: true },
-  { id: 'assignTime', label: 'Assign Job Time', defaultVisible: true },
-  { id: 'startTime', label: 'Start Job Time', defaultVisible: true },
+  { id: 'toCheck', label: 'To Check', defaultVisible: true },
   { id: 'new', label: 'New', defaultVisible: true },
   { id: 'edits', label: 'Edits', defaultVisible: true },
-  { id: 'fileOutput', label: 'File Output', defaultVisible: true },
   { id: 'proofRead', label: 'Proof read', defaultVisible: true },
   { id: 'mail', label: 'Mail', defaultVisible: true },
-  { id: 'action', label: 'Action', defaultVisible: true }
+  { id: 'action', label: 'Action', defaultVisible: true },
+  // Hidden columns by default
+  { id: 'timezone', label: 'Time Zone', defaultVisible: false },
+  { id: 'istTime', label: 'IST Time', defaultVisible: false },
+  { id: 'ticketTime', label: 'Ticket Time', defaultVisible: false },
+  { id: 'assignTime', label: 'Assign Job Time', defaultVisible: false },
+  { id: 'startTime', label: 'Start Job Time', defaultVisible: false },
+  { id: 'fileOutput', label: 'File Output', defaultVisible: false }
 ];
 
 /* ===================== DATE FORMATTER ===================== */
@@ -3271,9 +3274,23 @@ const CoordinatorDashboardHome = () => {
   const [isSyncing, setIsSyncing] = useState(false);
   const [lastSyncTime, setLastSyncTime] = useState(null);
 
+  // Column configuration version - increment this to reset user preferences to new defaults
+  const COLUMN_CONFIG_VERSION = 2; // v2: Updated default visible columns
+
   // Column order and visibility state
   const [columnOrder, setColumnOrder] = useState(() => {
     try {
+      // Check if we need to reset due to version change
+      const savedVersion = localStorage.getItem('coordinatorDashboardColumnVersion');
+      if (savedVersion !== String(COLUMN_CONFIG_VERSION)) {
+        // Version changed - clear old preferences and use new defaults
+        localStorage.removeItem('coordinatorDashboardColumnOrder');
+        localStorage.removeItem('coordinatorDashboardColumns');
+        localStorage.setItem('coordinatorDashboardColumnVersion', String(COLUMN_CONFIG_VERSION));
+        console.log('📋 Column preferences reset to new defaults (v' + COLUMN_CONFIG_VERSION + ')');
+        return DEFAULT_COLUMNS;
+      }
+
       const savedOrder = localStorage.getItem('coordinatorDashboardColumnOrder');
       if (savedOrder) {
         const parsed = JSON.parse(savedOrder);
@@ -3310,6 +3327,12 @@ const CoordinatorDashboardHome = () => {
 
   const [visibleColumns, setVisibleColumns] = useState(() => {
     try {
+      // If version was just reset in columnOrder initialization, use defaults
+      const savedVersion = localStorage.getItem('coordinatorDashboardColumnVersion');
+      if (savedVersion !== String(COLUMN_CONFIG_VERSION)) {
+        return DEFAULT_COLUMNS.reduce((acc, col) => ({ ...acc, [col.id]: col.defaultVisible }), {});
+      }
+
       const saved = localStorage.getItem('coordinatorDashboardColumns');
       if (saved) {
         const parsed = JSON.parse(saved);
@@ -3325,7 +3348,7 @@ const CoordinatorDashboardHome = () => {
     } catch (error) {
       console.error('Failed to load column visibility from localStorage:', error);
     }
-    // Default: all columns visible
+    // Default visibility based on column config
     return DEFAULT_COLUMNS.reduce((acc, col) => ({ ...acc, [col.id]: col.defaultVisible }), {});
   });
 
