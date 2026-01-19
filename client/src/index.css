@@ -1,0 +1,355 @@
+@import "tailwindcss";
+
+/* ============================================
+   GMAIL-STYLE EMAIL CONTENT STYLING
+   Matches Google Gmail's actual design
+   ============================================ */
+
+/* Gmail Email Wrapper - Exact Gmail Layout */
+.gmail-email-wrapper {
+  background: #ffffff;
+  padding: 20px 0;
+  min-height: 200px;
+  /* Reset any inherited styles */
+  all: initial;
+  background: #ffffff;
+  padding: 20px 0;
+  display: block;
+}
+
+/* Main Email Content Container - PRESERVE ORIGINAL EMAIL STYLING */
+.email-content {
+  /* Only set defaults for unstyled elements, don't force styles with !important */
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 14px;
+  line-height: normal;
+  color: #222222;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  background: transparent;
+
+  /* Allow all content to render naturally */
+  display: block;
+}
+
+.email-content.gmail-style {
+  max-width: 100%;
+  padding: 0;
+
+  /* Ensure original email styles take precedence */
+  all: revert;
+  max-width: 100%;
+  padding: 0;
+  display: block;
+}
+
+/* Allow all inline styles from original email - NO OVERRIDES */
+.email-content *,
+.email-content *[style] {
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+/* Reset margins for container only */
+.email-content > *:first-child:not([style*="margin"]) {
+  margin-top: 0;
+}
+
+.email-content > *:last-child:not([style*="margin"]) {
+  margin-bottom: 0;
+}
+
+/* Paragraphs - Default Gmail spacing (can be overridden by inline styles) */
+.email-content p:not([style*="margin"]):not([style*="line-height"]) {
+  margin: 0 0 1em 0;
+  line-height: 1.5;
+}
+
+/* Divs - common in HTML emails - don't override inline styles */
+.email-content div {
+  max-width: 100%;
+}
+
+/* Spans and inline elements - preserve all original styling */
+.email-content span {
+  /* No overrides - preserve everything */
+}
+
+/* Links - Only color links without their own color */
+.email-content a:not([style*="color"]) {
+  color: #1155cc;
+}
+
+.email-content a {
+  cursor: pointer;
+}
+
+.email-content a:hover:not([style*="text-decoration"]) {
+  text-decoration: underline;
+}
+
+/* Images - Gmail handling (preserve original sizing and layout) */
+.email-content img {
+  max-width: 100%;
+  height: auto;
+  display: inline-block;
+}
+
+/* Preserve image dimensions if specified */
+.email-content img[width] {
+  width: auto;
+  max-width: 100%;
+}
+
+.email-content img[height] {
+  height: auto;
+}
+
+/* Tables - Preserve original email table layout */
+.email-content table {
+  border-collapse: collapse;
+  max-width: 100%;
+}
+
+.email-content table td,
+.email-content table th {
+  /* Preserve original cell styling */
+}
+
+/* Only apply border to tables that don't have inline border styles */
+.email-content table[border="1"]:not([style*="border"]) {
+  border: 1px solid #dadce0;
+}
+
+.email-content table[border="1"]:not([style*="border"]) td,
+.email-content table[border="1"]:not([style*="border"]) th {
+  border: 1px solid #dadce0;
+  padding: 8px 12px;
+}
+
+/* Quoted text - Gmail style (gray background) */
+.email-content blockquote {
+  border-left: 3px solid #c5c7c9;
+  padding-left: 12px;
+  margin: 8px 0;
+  color: #5f6368;
+}
+
+/* Gmail quoted text (reply chains) */
+.email-content .gmail_quote {
+  margin: 12px 0 0 0;
+  padding: 8px 0 0 12px;
+  border-left: 2px solid #dadce0;
+  color: #5f6368;
+  font-size: 13px;
+}
+
+/* Gmail signature separator */
+.email-content .gmail_signature {
+  margin-top: 16px;
+  padding-top: 8px;
+}
+
+/* Lists - Gmail spacing */
+.email-content ul,
+.email-content ol {
+  margin: 8px 0;
+  padding-left: 32px;
+}
+
+.email-content li {
+  margin: 4px 0;
+  line-height: 1.7;
+}
+
+.email-content ul {
+  list-style-type: disc;
+}
+
+.email-content ol {
+  list-style-type: decimal;
+}
+
+/* Nested lists */
+.email-content ul ul,
+.email-content ol ul {
+  list-style-type: circle;
+  margin: 4px 0;
+}
+
+.email-content ul ul ul,
+.email-content ol ul ul {
+  list-style-type: square;
+}
+
+/* Headings - Only apply to headings without inline styles */
+.email-content h1:not([style]),
+.email-content h2:not([style]),
+.email-content h3:not([style]),
+.email-content h4:not([style]),
+.email-content h5:not([style]),
+.email-content h6:not([style]) {
+  margin: 16px 0 8px 0;
+  line-height: 1.4;
+  font-weight: 600;
+}
+
+.email-content h1:not([style]) { font-size: 24px; }
+.email-content h2:not([style]) { font-size: 20px; }
+.email-content h3:not([style]) { font-size: 18px; }
+.email-content h4:not([style]) { font-size: 16px; }
+.email-content h5:not([style]) { font-size: 14px; }
+.email-content h6:not([style]) { font-size: 13px; }
+
+/* Strong/Bold text - preserve original if it has styles */
+.email-content strong,
+.email-content b {
+  font-weight: bold;
+}
+
+/* Italic text */
+.email-content em,
+.email-content i {
+  font-style: italic;
+}
+
+/* Code - Gmail style */
+.email-content code {
+  background-color: #f1f3f4;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-family: 'Roboto Mono', 'Courier New', monospace;
+  font-size: 13px;
+  color: #202124;
+}
+
+.email-content pre {
+  background-color: #f8f9fa;
+  padding: 12px;
+  border-radius: 4px;
+  overflow-x: auto;
+  margin: 12px 0;
+  border: 1px solid #e8eaed;
+}
+
+.email-content pre code {
+  background-color: transparent;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* Horizontal rule */
+.email-content hr {
+  border: none;
+  border-top: 1px solid #dadce0;
+  margin: 16px 0;
+  height: 0;
+}
+
+/* Text formatting */
+.email-content u {
+  text-decoration: underline;
+}
+
+.email-content s,
+.email-content strike,
+.email-content del {
+  text-decoration: line-through;
+}
+
+.email-content sub {
+  vertical-align: sub;
+  font-size: smaller;
+}
+
+.email-content sup {
+  vertical-align: super;
+  font-size: smaller;
+}
+
+/* Font colors - ALWAYS preserve sender's formatting */
+.email-content [style*="color"] {
+  /* Inline colors are preserved automatically */
+}
+
+/* Background colors - ALWAYS preserve sender's formatting */
+.email-content [style*="background"] {
+  /* Inline backgrounds are preserved automatically */
+}
+
+/* Gmail-specific classes */
+.email-content .gmail_default {
+  /* Preserve Gmail's default styling */
+}
+
+/* Remove extra spacing in nested tables (common in email templates) */
+.email-content table table {
+  margin: 0;
+}
+
+/* Ensure text wrapping but preserve all other styles */
+.email-content * {
+  max-width: 100%;
+}
+
+/* Preserve all font families from original email */
+.email-content [style*="font-family"],
+.email-content [style*="font-size"],
+.email-content [style*="line-height"],
+.email-content [style*="text-align"],
+.email-content [style*="padding"],
+.email-content [style*="margin"],
+.email-content [style*="border"],
+.email-content [style*="width"],
+.email-content [style*="height"] {
+  /* All inline styles are preserved */
+}
+
+/* Plain text email formatting - Gmail style */
+.email-content.gmail-plaintext {
+  font-family: Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.7;
+  color: #222222;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+
+/* Preserve whitespace for plain text emails converted to HTML */
+.email-content .plaintext {
+  white-space: pre-wrap;
+  font-family: Arial, sans-serif;
+}
+
+/* Print styles for forwarding/printing */
+@media print {
+  .email-content {
+    font-size: 12pt;
+    line-height: 1.5;
+  }
+
+  .email-content a {
+    color: #1a73e8;
+    text-decoration: underline;
+  }
+}
+
+/* Responsive email content */
+@media (max-width: 768px) {
+  .email-content {
+    font-size: 15px;
+  }
+
+  .email-content img {
+    max-width: 100% !important;
+    height: auto !important;
+  }
+
+  .email-content table {
+    width: 100% !important;
+    display: block;
+    overflow-x: auto;
+  }
+}

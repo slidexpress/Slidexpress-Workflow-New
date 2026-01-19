@@ -1,0 +1,13 @@
+{
+  "jobId": "JOB-TEST-123",
+  "consultantName": "Test Consultant",
+  "clientName": "Test Client",
+  "clientEmail": "test@example.com",
+  "subject": "Test Ticket",
+  "createdBy": "System",
+  "assignedInfo": {
+    "empName": "Isha Gupta"
+  },
+  "status": "completed",
+  "description": "Added drag-and-drop functionality to the 'My Day's Utilization' timeline in Tasks.jsx. This allows users to reorder tasks and change their start times by dragging and dropping them within the timeline. The timeline updates to reflect the new order and recalculated start times."
+}
