@@ -294,37 +294,33 @@ exports.sendAssignmentEmail = async (recipientEmail, ticketData, attachments = [
       throw new Error('Recipient email is required');
     }
 
-    // Try SMTP first, then Resend API as fallback (cloud platforms often block SMTP)
-    let smtpError = null;
+    // Prioritize Resend API for cloud platforms (SMTP often blocked)
+    // Fall back to SMTP if Resend fails or is not configured
 
-    // Try SMTP
+    // Try Resend API first (more reliable on cloud platforms like Render)
+    if (process.env.RESEND_API_KEY) {
+      try {
+        console.log('📨 Sending email via Resend API (primary)...');
+        await sendWithResend(mailOptions);
+        console.log(`✅ Assignment email sent via Resend to: ${recipientEmail}`);
+        console.log(`====== EMAIL SENT SUCCESSFULLY (via Resend) ======\n`);
+        return { success: true };
+      } catch (resendErr) {
+        console.error(`❌ Resend failed: ${resendErr.message}`);
+        console.log('🔄 Falling back to SMTP...');
+      }
+    }
+
+    // Try SMTP as fallback (or primary if Resend not configured)
     try {
       console.log('📨 Sending email via SMTP...');
       await sendWithFallback(mailOptions);
       console.log(`✅ Assignment email sent successfully to: ${recipientEmail}`);
       console.log(`====== EMAIL SENT SUCCESSFULLY ======\n`);
       return { success: true };
-    } catch (err) {
-      smtpError = err;
-      console.error(`❌ SMTP failed: ${err.message}`);
-    }
-
-    // Try Resend API as fallback
-    if (process.env.RESEND_API_KEY) {
-      try {
-        console.log('🔄 Trying Resend API as fallback...');
-        await sendWithResend(mailOptions);
-        console.log(`✅ Assignment email sent via Resend to: ${recipientEmail}`);
-        console.log(`====== EMAIL SENT SUCCESSFULLY (via Resend) ======\n`);
-        return { success: true };
-      } catch (resendErr) {
-        console.error(`❌ Resend also failed: ${resendErr.message}`);
-        // Throw the original SMTP error as it's usually more descriptive
-        throw smtpError;
-      }
-    } else {
-      console.log('⚠️ Resend API not configured - no fallback available');
-      throw smtpError;
+    } catch (smtpErr) {
+      console.error(`❌ SMTP also failed: ${smtpErr.message}`);
+      throw smtpErr;
     }
   } catch (error) {
     console.error(`\n❌ ====== EMAIL SENDING FAILED ======`);
