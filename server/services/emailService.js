@@ -14,9 +14,9 @@ const createImapConnection = (email, password) => {
     port: 993,
     tls: true,
     tlsOptions: { rejectUnauthorized: false },
-    connTimeout: 15000,   // 15 seconds for connection (increased for reliability)
-    authTimeout: 15000,   // 15 seconds for authentication (increased for reliability)
-    socketTimeout: 15000, // 15 seconds for socket operations (increased for reliability)
+    connTimeout: 30000,   // 30 seconds for connection (increased for cloud environments)
+    authTimeout: 30000,   // 30 seconds for authentication (increased for cloud environments)
+    socketTimeout: 30000, // 30 seconds for socket operations (increased for cloud environments)
     keepalive: { interval: 10000, idleInterval: 300000 }
   });
 };
@@ -130,14 +130,14 @@ const fetchFullEmailByUid = (email, password, uid) =>
     let connectionTimeout;
     let isResolved = false;
 
-    // Add 15 second timeout (increased for reliability)
+    // Add 30 second timeout (increased for cloud environments)
     connectionTimeout = setTimeout(() => {
       if (!isResolved) {
         isResolved = true;
         imap.end();
         reject(new Error('Email fetch timeout - IMAP connection took too long'));
       }
-    }, 15000);
+    }, 30000);
 
     const cleanup = () => {
       clearTimeout(connectionTimeout);

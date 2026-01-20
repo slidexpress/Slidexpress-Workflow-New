@@ -25,9 +25,9 @@ const buildTransporter = (port, secure) => {
       user,
       pass: cleanedPassword
     },
-    connectionTimeout: 10000, // 10s
-    greetingTimeout: 10000,
-    socketTimeout: 10000,
+    connectionTimeout: 30000, // 30s (increased for cloud environments)
+    greetingTimeout: 30000,
+    socketTimeout: 30000,
     debug: true, // Enable debug output
     logger: true // Log to console
   });
@@ -35,6 +35,9 @@ const buildTransporter = (port, secure) => {
 
 const sendWithFallback = async (mailOptions) => {
   // Try SSL port 465 first, then STARTTLS 587 if connection times out/blocked
+  let lastError = null;
+
+  // Try port 465 (SSL)
   try {
     console.log('🔌 Attempting SMTP connection on port 465 (SSL)...');
     const primary = buildTransporter(465, true);
@@ -44,24 +47,25 @@ const sendWithFallback = async (mailOptions) => {
     console.log('✓ Email sent successfully via port 465');
     return result;
   } catch (err) {
-    console.warn(`⚠ Port 465 failed: ${err.message}`);
-    const transient = ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ESOCKET'];
-    if (!transient.includes(err?.code)) {
-      console.error('❌ Non-transient error, not retrying:', err.code, err.message);
-      throw err;
-    }
+    lastError = err;
+    console.warn(`⚠ Port 465 failed: ${err.code || 'NO_CODE'} - ${err.message}`);
+    console.warn(`⚠ Full error:`, JSON.stringify({ code: err.code, command: err.command, response: err.response }, null, 2));
+  }
+
+  // Try port 587 (STARTTLS) as fallback
+  try {
     console.log('🔄 Retrying with port 587 (STARTTLS)...');
-    try {
-      const fallback = buildTransporter(587, false);
-      await fallback.verify();
-      console.log('✓ SMTP connection verified on port 587');
-      const result = await fallback.sendMail(mailOptions);
-      console.log('✓ Email sent successfully via port 587');
-      return result;
-    } catch (fallbackErr) {
-      console.error('❌ Port 587 also failed:', fallbackErr.message);
-      throw fallbackErr;
-    }
+    const fallback = buildTransporter(587, false);
+    await fallback.verify();
+    console.log('✓ SMTP connection verified on port 587');
+    const result = await fallback.sendMail(mailOptions);
+    console.log('✓ Email sent successfully via port 587');
+    return result;
+  } catch (fallbackErr) {
+    console.error(`❌ Port 587 also failed: ${fallbackErr.code || 'NO_CODE'} - ${fallbackErr.message}`);
+    console.error(`❌ Full error:`, JSON.stringify({ code: fallbackErr.code, command: fallbackErr.command, response: fallbackErr.response }, null, 2));
+    // Throw the more descriptive error
+    throw fallbackErr.message.length > (lastError?.message?.length || 0) ? fallbackErr : lastError;
   }
 };
 
@@ -72,6 +76,25 @@ const sendWithResend = async (mailOptions) => {
     throw new Error('Resend not configured (RESEND_API_KEY and RESEND_FROM or EMAIL_USER required).');
   }
 
+  // Build payload with optional attachments
+  const payload = {
+    from,
+    to: Array.isArray(mailOptions.to) ? mailOptions.to : [mailOptions.to],
+    subject: mailOptions.subject,
+    html: mailOptions.html
+  };
+
+  // Add attachments if present (Resend supports base64 encoded attachments)
+  if (mailOptions.attachments && mailOptions.attachments.length > 0) {
+    payload.attachments = mailOptions.attachments.map(att => ({
+      filename: att.filename,
+      content: att.content instanceof Buffer ? att.content.toString('base64') : att.content,
+      content_type: att.contentType
+    }));
+  }
+
+  console.log(`📧 Sending via Resend API to: ${payload.to.join(', ')}`);
+
   // Use built-in fetch (Node 18+) to avoid extra dependency
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST',
@@ -79,18 +102,17 @@ const sendWithResend = async (mailOptions) => {
       Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({
-      from,
-      to: mailOptions.to,
-      subject: mailOptions.subject,
-      html: mailOptions.html
-    })
+    body: JSON.stringify(payload)
   });
 
   if (!response.ok) {
     const body = await response.text();
     throw new Error(`Resend failed: ${response.status} ${body}`);
   }
+
+  const result = await response.json();
+  console.log(`✅ Resend email sent successfully: ${result.id}`);
+  return result;
 };
 
 // Send OTP email
@@ -226,12 +248,21 @@ exports.sendAssignmentEmail = async (recipientEmail, ticketData, attachments = [
     </div>
   `;
 
+  // Filter out attachments with missing content to prevent nodemailer errors
+  const validAttachments = attachments.filter(att => {
+    if (!att.content) {
+      console.log(`⚠️ Skipping attachment "${att.filename}" - no content available`);
+      return false;
+    }
+    return true;
+  });
+
   const mailOptions = {
     from: process.env.EMAIL_USER,
     to: recipientEmail,
     subject: subject,
     html: message,
-    attachments: attachments.map(att => ({
+    attachments: validAttachments.map(att => ({
       filename: att.filename,
       content: att.content,
       contentType: att.contentType
@@ -243,7 +274,7 @@ exports.sendAssignmentEmail = async (recipientEmail, ticketData, attachments = [
     console.log(`📧 To: ${recipientEmail}`);
     console.log(`📋 Job ID: ${jobId}`);
     console.log(`👤 Client: ${clientName}`);
-    console.log(`📎 Attachments: ${attachments?.length || 0}`);
+    console.log(`📎 Attachments: ${validAttachments.length} valid of ${attachments?.length || 0} total`);
     if (attachments && attachments.length > 0) {
       console.log(`📎 Attachment Details:`);
       attachments.forEach((att, idx) => {
@@ -263,13 +294,38 @@ exports.sendAssignmentEmail = async (recipientEmail, ticketData, attachments = [
       throw new Error('Recipient email is required');
     }
 
-    // Always use SMTP for assignment emails (better reliability)
-    console.log('📨 Sending email via SMTP...');
-    await sendWithFallback(mailOptions);
+    // Try SMTP first, then Resend API as fallback (cloud platforms often block SMTP)
+    let smtpError = null;
 
-    console.log(`✅ Assignment email sent successfully to: ${recipientEmail}`);
-    console.log(`====== EMAIL SENT SUCCESSFULLY ======\n`);
-    return { success: true };
+    // Try SMTP
+    try {
+      console.log('📨 Sending email via SMTP...');
+      await sendWithFallback(mailOptions);
+      console.log(`✅ Assignment email sent successfully to: ${recipientEmail}`);
+      console.log(`====== EMAIL SENT SUCCESSFULLY ======\n`);
+      return { success: true };
+    } catch (err) {
+      smtpError = err;
+      console.error(`❌ SMTP failed: ${err.message}`);
+    }
+
+    // Try Resend API as fallback
+    if (process.env.RESEND_API_KEY) {
+      try {
+        console.log('🔄 Trying Resend API as fallback...');
+        await sendWithResend(mailOptions);
+        console.log(`✅ Assignment email sent via Resend to: ${recipientEmail}`);
+        console.log(`====== EMAIL SENT SUCCESSFULLY (via Resend) ======\n`);
+        return { success: true };
+      } catch (resendErr) {
+        console.error(`❌ Resend also failed: ${resendErr.message}`);
+        // Throw the original SMTP error as it's usually more descriptive
+        throw smtpError;
+      }
+    } else {
+      console.log('⚠️ Resend API not configured - no fallback available');
+      throw smtpError;
+    }
   } catch (error) {
     console.error(`\n❌ ====== EMAIL SENDING FAILED ======`);
     console.error(`❌ To: ${recipientEmail}`);

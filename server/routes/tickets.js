@@ -468,9 +468,9 @@ router.post('/:id/send-assignment-email', async (req, res) => {
       // Collect attachments from all emails (limit to avoid huge emails)
       for (const email of emails) {
         if (email.attachments && email.attachments.length > 0) {
-          // Filter out inline images and add file attachments
+          // Filter out inline images and attachments without content
           const fileAttachments = email.attachments
-            .filter(att => !att.contentId) // Exclude inline images
+            .filter(att => !att.contentId && att.content) // Exclude inline images AND missing content
             .slice(0, 5) // Limit attachments per email
             .map(att => ({
               filename: att.filename,
@@ -478,7 +478,7 @@ router.post('/:id/send-assignment-email', async (req, res) => {
               contentType: att.contentType
             }));
 
-          console.log(`📎 Found ${fileAttachments.length} file attachments in email "${email.subject}"`);
+          console.log(`📎 Found ${fileAttachments.length} valid file attachments in email "${email.subject}" (${email.attachments.length} total)`);
           attachments = attachments.concat(fileAttachments);
 
           // Limit total attachments to avoid email size issues
@@ -529,7 +529,7 @@ router.post('/:id/send-assignment-email', async (req, res) => {
             // Also collect attachments from the fetched email
             if (fullEmailData.attachments && fullEmailData.attachments.length > 0) {
               const fetchedAttachments = fullEmailData.attachments
-                .filter(att => !att.contentId) // Exclude inline images
+                .filter(att => !att.contentId && att.content) // Exclude inline images AND missing content
                 .slice(0, 10)
                 .map(att => ({
                   filename: att.filename,
@@ -537,7 +537,7 @@ router.post('/:id/send-assignment-email', async (req, res) => {
                   contentType: att.contentType
                 }));
 
-              console.log(`📎 Found ${fetchedAttachments.length} attachments in fetched email body`);
+              console.log(`📎 Found ${fetchedAttachments.length} valid attachments in fetched email body (${fullEmailData.attachments.length} total)`);
 
               // Merge with existing attachments, avoiding duplicates by filename
               const existingFilenames = new Set(attachments.map(a => a.filename));
@@ -592,14 +592,15 @@ router.post('/:id/send-assignment-email', async (req, res) => {
     } else {
       console.log(`❌ Failed to send assignment email: ${result.error}`);
       res.status(500).json({
-        message: 'Failed to send assignment email',
-        error: result.error
+        message: `Failed to send assignment email: ${result.error}`,
+        error: result.error,
+        recipient: teamMember.emailId
       });
     }
   } catch (err) {
     console.error('Send assignment email error:', err);
     res.status(500).json({
-      message: 'Error sending assignment email',
+      message: `Error sending assignment email: ${err.message}`,
       error: err.message
     });
   }
