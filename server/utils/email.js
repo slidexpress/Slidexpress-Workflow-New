@@ -115,6 +115,60 @@ const sendWithResend = async (mailOptions) => {
   return result;
 };
 
+// Send email using Brevo (Sendinblue) API - Works great in India
+const sendWithBrevo = async (mailOptions) => {
+  const apiKey = process.env.BREVO_API_KEY;
+  const senderEmail = process.env.BREVO_SENDER_EMAIL || process.env.EMAIL_USER;
+  const senderName = process.env.BREVO_SENDER_NAME || 'Slidexpress Workflow';
+
+  if (!apiKey) {
+    throw new Error('Brevo not configured (BREVO_API_KEY required).');
+  }
+
+  // Build Brevo payload
+  const payload = {
+    sender: {
+      name: senderName,
+      email: senderEmail
+    },
+    to: [{
+      email: mailOptions.to,
+      name: mailOptions.to.split('@')[0] // Use email prefix as name
+    }],
+    subject: mailOptions.subject,
+    htmlContent: mailOptions.html
+  };
+
+  // Add attachments if present (Brevo supports base64 encoded attachments)
+  if (mailOptions.attachments && mailOptions.attachments.length > 0) {
+    payload.attachment = mailOptions.attachments.map(att => ({
+      name: att.filename,
+      content: att.content instanceof Buffer ? att.content.toString('base64') : att.content
+    }));
+  }
+
+  console.log(`📧 Sending via Brevo API to: ${mailOptions.to}`);
+
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'api-key': apiKey,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Brevo failed: ${response.status} ${body}`);
+  }
+
+  const result = await response.json();
+  console.log(`✅ Brevo email sent successfully: MessageId ${result.messageId}`);
+  return result;
+};
+
 // Send OTP email
 exports.sendOTPEmail = async (email, otp, purpose) => {
   const subject = purpose === 'first_login'
@@ -294,13 +348,27 @@ exports.sendAssignmentEmail = async (recipientEmail, ticketData, attachments = [
       throw new Error('Recipient email is required');
     }
 
-    // Prioritize Resend API for cloud platforms (SMTP often blocked)
-    // Fall back to SMTP if Resend fails or is not configured
+    // Priority order: Brevo (best for India) > Resend > SMTP
+    // Cloud platforms like Render often block SMTP ports
 
-    // Try Resend API first (more reliable on cloud platforms like Render)
+    // Try Brevo API first (best for India, 300 free emails/day)
+    if (process.env.BREVO_API_KEY) {
+      try {
+        console.log('📨 Sending email via Brevo API (primary)...');
+        await sendWithBrevo(mailOptions);
+        console.log(`✅ Assignment email sent via Brevo to: ${recipientEmail}`);
+        console.log(`====== EMAIL SENT SUCCESSFULLY (via Brevo) ======\n`);
+        return { success: true };
+      } catch (brevoErr) {
+        console.error(`❌ Brevo failed: ${brevoErr.message}`);
+        console.log('🔄 Trying next method...');
+      }
+    }
+
+    // Try Resend API as second option
     if (process.env.RESEND_API_KEY) {
       try {
-        console.log('📨 Sending email via Resend API (primary)...');
+        console.log('📨 Sending email via Resend API...');
         await sendWithResend(mailOptions);
         console.log(`✅ Assignment email sent via Resend to: ${recipientEmail}`);
         console.log(`====== EMAIL SENT SUCCESSFULLY (via Resend) ======\n`);
@@ -311,12 +379,12 @@ exports.sendAssignmentEmail = async (recipientEmail, ticketData, attachments = [
       }
     }
 
-    // Try SMTP as fallback (or primary if Resend not configured)
+    // Try SMTP as last fallback
     try {
       console.log('📨 Sending email via SMTP...');
       await sendWithFallback(mailOptions);
       console.log(`✅ Assignment email sent successfully to: ${recipientEmail}`);
-      console.log(`====== EMAIL SENT SUCCESSFULLY ======\n`);
+      console.log(`====== EMAIL SENT SUCCESSFULLY (via SMTP) ======\n`);
       return { success: true };
     } catch (smtpErr) {
       console.error(`❌ SMTP also failed: ${smtpErr.message}`);
