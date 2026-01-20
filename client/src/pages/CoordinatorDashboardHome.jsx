@@ -3450,7 +3450,7 @@ const CoordinatorDashboardHome = () => {
   };
 
   /* ======== SYNC EMAILS FROM GMAIL ======== */
-  const syncEmails = async () => {
+  const syncEmails = async (showFeedback = false) => {
     // ⚡ NON-BLOCKING: Show indicator but don't block UI
     setIsEmailSyncing(true);
     try {
@@ -3458,17 +3458,23 @@ const CoordinatorDashboardHome = () => {
       const startTime = Date.now();
       const res = await emailAPI.syncEmails();
       const duration = Date.now() - startTime;
-      console.log(`✅ Email sync completed in ${duration}ms:`, res.data?.emailsFetched || 0, 'emails,', res.data?.ticketsCreated || 0, 'new tickets');
+      const ticketsCreated = res.data?.ticketsCreated || 0;
+      console.log(`✅ Email sync completed in ${duration}ms:`, res.data?.emailsFetched || 0, 'emails,', ticketsCreated, 'new tickets');
 
-      // Show toast only if new tickets were created
-      if (res.data?.ticketsCreated > 0) {
-        showToast(`${res.data.ticketsCreated} new ticket(s) created from Gmail`);
-        // Refresh tickets to show new ones
+      // Show toast if new tickets were created OR if manual sync requested
+      if (ticketsCreated > 0) {
+        showToast(`${ticketsCreated} new starred email(s) synced from Gmail`, 'success');
+        // ⚡ BACKGROUND REFRESH: Update ticket list without page reload
         fetchTickets(false, false);
+      } else if (showFeedback) {
+        showToast('No new starred emails found', 'info');
       }
     } catch (error) {
       console.error('❌ Error syncing emails:', error);
-      // Don't show toast for auto-sync errors to avoid interrupting user
+      // Show error only for manual sync
+      if (showFeedback) {
+        showToast('Failed to sync emails from Gmail', 'error');
+      }
     } finally {
       setIsEmailSyncing(false);
     }
@@ -3579,11 +3585,11 @@ const CoordinatorDashboardHome = () => {
       fetchTickets(false, false);
     }, 60000);
 
-    // Separate slower email sync every 2 minutes
+    // ⚡ FAST EMAIL SYNC: Check for new starred emails every 30 seconds
     const emailSyncInterval = setInterval(() => {
-      console.log('🔄 Background email sync...');
+      console.log('📧 Auto-syncing starred emails...');
       syncEmails();
-    }, 120000);
+    }, 30000);
 
     // Cleanup intervals on component unmount
     return () => {
@@ -3593,9 +3599,10 @@ const CoordinatorDashboardHome = () => {
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const showToast = (msg) => {
-    setToast(msg);
-    setTimeout(() => setToast(null), 10000);
+  const showToast = (msg, type = 'info') => {
+    // type can be: 'success', 'error', 'warning', 'info'
+    setToast({ message: msg, type });
+    setTimeout(() => setToast(null), type === 'success' ? 5000 : 8000);
   };
 
   const getStatusCount = (status) => tickets.filter(t => t.status === status).length;
@@ -3758,11 +3765,11 @@ const CoordinatorDashboardHome = () => {
       console.log('✅ Delete response:', response.data);
 
       setTickets(prev => prev.filter(t => t._id !== ticketId));
-      showToast("Ticket deleted successfully");
+      showToast("Ticket deleted successfully", 'success');
     } catch (error) {
       console.error('❌ Error deleting ticket:', error);
       console.error('Error details:', error.response?.data || error.message);
-      showToast(`Failed to delete ticket: ${error.response?.data?.message || error.message}`);
+      showToast(`Failed to delete ticket: ${error.response?.data?.message || error.message}`, 'error');
     }
   };
 
@@ -3784,11 +3791,11 @@ const CoordinatorDashboardHome = () => {
       console.log('✅ Undo response:', response.data);
 
       setTickets(prev => prev.filter(t => t._id !== ticketId));
-      showToast("Ticket undone successfully. Email(s) restored to Mail page.");
+      showToast("Ticket undone successfully. Email(s) restored to Mail page.", 'success');
     } catch (error) {
       console.error('❌ Error undoing ticket:', error);
       console.error('Error details:', error.response?.data || error.message);
-      showToast(`Failed to undo ticket: ${error.response?.data?.message || error.message}`);
+      showToast(`Failed to undo ticket: ${error.response?.data?.message || error.message}`, 'error');
     }
   };
 
@@ -3961,7 +3968,7 @@ const CoordinatorDashboardHome = () => {
       }
     } catch (error) {
       console.error('Error creating ticket:', error);
-      showToast(`Failed to create ticket: ${error.response?.data?.message || error.message}`);
+      showToast(`Failed to create ticket: ${error.response?.data?.message || error.message}`, 'error');
       throw error; // Re-throw to keep modal open
     }
   };
@@ -4031,7 +4038,7 @@ const CoordinatorDashboardHome = () => {
       const response = await ticketAPI.assignTicket(ticket._id, patch);
       console.log(`✅ Team member ${empName} added successfully:`, response.data);
       updateSaveStatus(ticket._id, SAVE_STATUS.SAVED);
-      showToast(`Added ${empName} to the team`);
+      showToast(`Added ${empName} to the team`, 'success');
 
       // If ticket is already in "assigned" status, send email ONLY to the newly added member
       if (ticket.status === 'assigned') {
@@ -4039,17 +4046,17 @@ const CoordinatorDashboardHome = () => {
         try {
           const emailResponse = await ticketAPI.sendAssignmentEmail(ticket._id, empName);
           const attachmentCount = emailResponse.data?.attachmentCount || 0;
-          showToast(`✅ Email sent to ${empName}${attachmentCount > 0 ? ` with ${attachmentCount} attachment(s)` : ''}`);
+          showToast(`Email sent to ${empName}${attachmentCount > 0 ? ` with ${attachmentCount} attachment(s)` : ''}`, 'success');
         } catch (emailError) {
           console.error(`❌ Error sending email to ${empName}:`, emailError);
-          showToast(`⚠️ Warning: Failed to send email to ${empName}. Assignment was saved.`);
+          showToast(`Failed to send email to ${empName}: ${emailError.response?.data?.message || emailError.message}`, 'error');
         }
       }
     } catch (error) {
       console.error(`❌ Error adding team member ${empName}:`, error);
       console.error('Error response:', error.response?.data);
       updateSaveStatus(ticket._id, SAVE_STATUS.ERROR);
-      showToast(`Failed to add ${empName}`);
+      showToast(`Failed to add ${empName}`, 'error');
       // Rollback
       setTickets(prev => prev.map(t => t._id === ticket._id ? ticket : t));
     }
@@ -4104,7 +4111,7 @@ const CoordinatorDashboardHome = () => {
     } catch (error) {
       console.error('Error removing team member:', error);
       updateSaveStatus(ticket._id, SAVE_STATUS.ERROR);
-      showToast(`Failed to remove ${empName}`);
+      showToast(`Failed to remove ${empName}`, 'error');
       // Rollback
       setTickets(prev => prev.map(t => t._id === ticket._id ? ticket : t));
     }
@@ -5016,8 +5023,17 @@ const CoordinatorDashboardHome = () => {
 
       {/* TOAST */}
       {toast && (
-        <div className="fixed bottom-4 right-4 bg-gray-900 text-white px-6 py-3 rounded-lg shadow-lg text-[13px] font-medium">
-          {toast}
+        <div className={`fixed bottom-4 right-4 px-6 py-4 rounded-lg shadow-xl text-[14px] font-medium flex items-center gap-3 z-50 ${
+          toast.type === 'success' ? 'bg-green-600 text-white' :
+          toast.type === 'error' ? 'bg-red-600 text-white' :
+          toast.type === 'warning' ? 'bg-yellow-500 text-gray-900' :
+          'bg-gray-900 text-white'
+        }`}>
+          {toast.type === 'success' && <span className="text-xl">✓</span>}
+          {toast.type === 'error' && <span className="text-xl">✕</span>}
+          {toast.type === 'warning' && <span className="text-xl">⚠</span>}
+          {toast.type === 'info' && <span className="text-xl">ℹ</span>}
+          {toast.message || toast}
         </div>
       )}
     </div>

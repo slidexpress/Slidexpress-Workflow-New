@@ -392,19 +392,50 @@ router.post('/:id/send-assignment-email', async (req, res) => {
     }
     console.log(`✓ Ticket found: ${ticket.jobId}`);
 
-    // Get team member email
-    const teamMember = await TeamMember.findOne({ name: empName });
+    // Get team member email - use case-insensitive regex match with trimmed name
+    const trimmedName = empName.trim();
+    console.log(`🔍 Looking up team member: "${trimmedName}"`);
+
+    let teamMember = await TeamMember.findOne({ name: trimmedName });
+
+    // If exact match fails, try case-insensitive search
+    if (!teamMember) {
+      console.log(`⚠️ Exact match failed for "${trimmedName}", trying case-insensitive search...`);
+      teamMember = await TeamMember.findOne({
+        name: { $regex: new RegExp(`^${trimmedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }
+      });
+    }
+
+    // If still not found, this might be a team lead - search by tlName
+    if (!teamMember) {
+      console.log(`⚠️ Not found by name, checking if "${trimmedName}" is a team lead...`);
+      const memberUnderThisTL = await TeamMember.findOne({
+        tlName: { $regex: new RegExp(`^${trimmedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }
+      });
+
+      if (memberUnderThisTL) {
+        console.log(`✓ Found "${trimmedName}" as a team lead (tlName). Looking for their own record...`);
+        teamMember = await TeamMember.findOne({
+          name: { $regex: new RegExp(`^${memberUnderThisTL.tlName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }
+        });
+      }
+    }
+
     if (!teamMember) {
       console.log(`❌ Team member not found in database: ${empName}`);
+      const allMembers = await TeamMember.find().select('name tlName emailId').lean();
+      console.log(`📋 Available team members in database:`);
+      allMembers.forEach(m => console.log(`   - "${m.name}" (TL: ${m.tlName}, Email: ${m.emailId || 'NOT SET'})`));
+
       return res.status(404).json({
-        message: `Team member not found: ${empName}. Please ensure the team member exists in the system.`
+        message: `Team member not found: ${empName}. Please ensure the team member exists in the system with an email address configured.`
       });
     }
 
     if (!teamMember.emailId) {
       console.log(`❌ Team member exists but has no email: ${empName}`);
       return res.status(400).json({
-        message: `Email address not configured for team member: ${empName}. Please add an email address in the team member settings.`
+        message: `Email address not configured for team member: ${empName}. Please add an email address in Team Members settings.`
       });
     }
 
