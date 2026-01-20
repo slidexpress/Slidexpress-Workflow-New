@@ -3252,6 +3252,7 @@ const CoordinatorDashboardHome = () => {
   const [teamMap, setTeamMap] = useState({});
   const [allEmps, setAllEmps] = useState([]);
   const [teamMemberColors, setTeamMemberColors] = useState({}); // Store member name -> color mapping
+  const [teamMemberEmails, setTeamMemberEmails] = useState({}); // Store member name -> emailId mapping
   const [saveStatusMap, setSaveStatusMap] = useState({}); // Track save status per ticket
   const [pendingSavesMap, setPendingSavesMap] = useState({}); // Track pending save data
   const [showEditModal, setShowEditModal] = useState(false);
@@ -3550,15 +3551,21 @@ const CoordinatorDashboardHome = () => {
       setTeamMap(fetchedTeamMap || {});
       setAllEmps(Object.values(fetchedTeamMap || {}).flat());
 
-      // Create a mapping of member name -> teamName (color)
+      // Create mappings from team members data
       if (teamMembers && Array.isArray(teamMembers)) {
         const colorMap = {};
+        const emailMap = {};
         teamMembers.forEach(member => {
-          if (member.name && member.teamName) {
-            colorMap[member.name] = member.teamName;
+          if (member.name) {
+            if (member.teamName) {
+              colorMap[member.name] = member.teamName;
+            }
+            // Store email mapping (null if not configured)
+            emailMap[member.name] = member.emailId || null;
           }
         });
         setTeamMemberColors(colorMap);
+        setTeamMemberEmails(emailMap);
       }
     } catch (error) {
       console.error("Error loading team members:", error);
@@ -4049,14 +4056,20 @@ const CoordinatorDashboardHome = () => {
 
       // If ticket is already in "assigned" status, send email ONLY to the newly added member
       if (ticket.status === 'assigned') {
-        console.log(`📧 Sending assignment email to newly added member: ${empName}`);
-        try {
-          const emailResponse = await ticketAPI.sendAssignmentEmail(ticket._id, empName);
-          const attachmentCount = emailResponse.data?.attachmentCount || 0;
-          showToast(`Email sent to ${empName}${attachmentCount > 0 ? ` with ${attachmentCount} attachment(s)` : ''}`, 'success');
-        } catch (emailError) {
-          console.error(`❌ Error sending email to ${empName}:`, emailError);
-          showToast(`Failed to send email to ${empName}: ${emailError.response?.data?.message || emailError.message}`, 'error');
+        // Check if team member has email configured
+        if (!teamMemberEmails[empName]) {
+          console.log(`⚠️ Team member ${empName} has no email configured`);
+          showToast(`${empName} has no email address configured. Please add email in Team Settings.`, 'warning');
+        } else {
+          console.log(`📧 Sending assignment email to newly added member: ${empName} (${teamMemberEmails[empName]})`);
+          try {
+            const emailResponse = await ticketAPI.sendAssignmentEmail(ticket._id, empName);
+            const attachmentCount = emailResponse.data?.attachmentCount || 0;
+            showToast(`Email sent to ${empName}${attachmentCount > 0 ? ` with ${attachmentCount} attachment(s)` : ''}`, 'success');
+          } catch (emailError) {
+            console.error(`❌ Error sending email to ${empName}:`, emailError);
+            showToast(`Failed to send email to ${empName}: ${emailError.response?.data?.message || emailError.message}`, 'error');
+          }
         }
       }
     } catch (error) {
@@ -4360,20 +4373,46 @@ const CoordinatorDashboardHome = () => {
       });
 
       if (teamMembers.length > 0) {
-        // Send emails to all team members
+        // Check which team members have emails configured
+        const membersWithEmail = teamMembers.filter(m => teamMemberEmails[m]);
+        const membersWithoutEmail = teamMembers.filter(m => !teamMemberEmails[m]);
+
+        console.log('📧 Email check:', {
+          membersWithEmail,
+          membersWithoutEmail,
+          teamMemberEmails
+        });
+
+        // Warn about members without email
+        if (membersWithoutEmail.length > 0) {
+          showToast(`Warning: ${membersWithoutEmail.join(', ')} - no email configured`, 'warning');
+        }
+
+        if (membersWithEmail.length === 0) {
+          updateSaveStatus(ticket._id, SAVE_STATUS.ERROR);
+          showToast("No team members have email addresses configured. Please add emails in Team Settings.", 'error');
+          return;
+        }
+
+        // Send emails only to team members with configured emails
         let emailsSent = 0;
         let totalAttachments = 0;
+        let lastError = null;
 
         // Show that we're sending emails
         updateSaveStatus(ticket._id, SAVE_STATUS.SAVING);
 
-        for (const member of teamMembers) {
+        for (const member of membersWithEmail) {
           try {
+            console.log(`📧 Sending assignment email to: ${member} (${teamMemberEmails[member]})`);
             const emailResponse = await ticketAPI.sendAssignmentEmail(ticket._id, member);
             emailsSent++;
             totalAttachments += emailResponse.data?.attachmentCount || 0;
+            console.log(`✅ Email sent successfully to ${member}`);
           } catch (error) {
-            console.error(`Error sending email to ${member}:`, error);
+            console.error(`❌ Error sending email to ${member}:`, error);
+            lastError = error.response?.data?.message || error.response?.data?.error || error.message;
+            console.error(`   Error details:`, lastError);
           }
         }
 
@@ -4382,7 +4421,9 @@ const CoordinatorDashboardHome = () => {
           showToast(`Emails sent to ${emailsSent} team member(s) with ${totalAttachments} total attachment(s)`);
         } else {
           updateSaveStatus(ticket._id, SAVE_STATUS.ERROR);
-          showToast("Failed to send assignment emails");
+          // Show more specific error message
+          const errorMsg = lastError ? `Failed to send emails: ${lastError}` : "Failed to send assignment emails";
+          showToast(errorMsg, 'error');
         }
       } else {
         showToast("Status changed to Assigned, but no team members to notify");
