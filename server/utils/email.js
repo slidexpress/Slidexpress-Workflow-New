@@ -195,11 +195,8 @@ exports.sendOTPEmail = async (email, otp, purpose) => {
   };
 
   try {
-    if (process.env.RESEND_API_KEY) {
-      await sendWithResend(mailOptions);
-    } else {
-      await sendWithFallback(mailOptions);
-    }
+    // Use Gmail SMTP directly
+    await sendWithFallback(mailOptions);
     return { success: true };
   } catch (error) {
     console.error('Email sending error:', error);
@@ -329,67 +326,17 @@ exports.sendAssignmentEmail = async (recipientEmail, ticketData, attachments = [
     console.log(`📋 Job ID: ${jobId}`);
     console.log(`👤 Client: ${clientName}`);
     console.log(`📎 Attachments: ${validAttachments.length} valid of ${attachments?.length || 0} total`);
-    if (attachments && attachments.length > 0) {
-      console.log(`📎 Attachment Details:`);
-      attachments.forEach((att, idx) => {
-        console.log(`   ${idx + 1}. ${att.filename} (${att.contentType}) - ${att.content ? 'Has Content' : 'NO CONTENT'}`);
-      });
-    }
-    console.log(`📬 Original Email: ${originalEmail ? 'Yes' : 'No'}`);
-    if (originalEmail) {
-      console.log(`📬 Original Email Details:`);
-      console.log(`   - Subject: ${originalEmail.subject || 'N/A'}`);
-      console.log(`   - Has Body: ${originalEmail.body ? 'Yes' : 'No'}`);
-      console.log(`   - Body HTML: ${originalEmail.body?.html?.length || 0} chars`);
-      console.log(`   - Body Text: ${originalEmail.body?.text?.length || 0} chars`);
-    }
 
     if (!recipientEmail) {
       throw new Error('Recipient email is required');
     }
 
-    // Priority order: Brevo (best for India) > Resend > SMTP
-    // Cloud platforms like Render often block SMTP ports
-
-    // Try Brevo API first (best for India, 300 free emails/day)
-    if (process.env.BREVO_API_KEY) {
-      try {
-        console.log('📨 Sending email via Brevo API (primary)...');
-        await sendWithBrevo(mailOptions);
-        console.log(`✅ Assignment email sent via Brevo to: ${recipientEmail}`);
-        console.log(`====== EMAIL SENT SUCCESSFULLY (via Brevo) ======\n`);
-        return { success: true };
-      } catch (brevoErr) {
-        console.error(`❌ Brevo failed: ${brevoErr.message}`);
-        console.log('🔄 Trying next method...');
-      }
-    }
-
-    // Try Resend API as second option
-    if (process.env.RESEND_API_KEY) {
-      try {
-        console.log('📨 Sending email via Resend API...');
-        await sendWithResend(mailOptions);
-        console.log(`✅ Assignment email sent via Resend to: ${recipientEmail}`);
-        console.log(`====== EMAIL SENT SUCCESSFULLY (via Resend) ======\n`);
-        return { success: true };
-      } catch (resendErr) {
-        console.error(`❌ Resend failed: ${resendErr.message}`);
-        console.log('🔄 Falling back to SMTP...');
-      }
-    }
-
-    // Try SMTP as last fallback
-    try {
-      console.log('📨 Sending email via SMTP...');
-      await sendWithFallback(mailOptions);
-      console.log(`✅ Assignment email sent successfully to: ${recipientEmail}`);
-      console.log(`====== EMAIL SENT SUCCESSFULLY (via SMTP) ======\n`);
-      return { success: true };
-    } catch (smtpErr) {
-      console.error(`❌ SMTP also failed: ${smtpErr.message}`);
-      throw smtpErr;
-    }
+    // Use Gmail SMTP directly
+    console.log('📨 Sending email via Gmail SMTP...');
+    await sendWithFallback(mailOptions);
+    console.log(`✅ Assignment email sent successfully to: ${recipientEmail}`);
+    console.log(`====== EMAIL SENT SUCCESSFULLY ======\n`);
+    return { success: true };
   } catch (error) {
     console.error(`\n❌ ====== EMAIL SENDING FAILED ======`);
     console.error(`❌ To: ${recipientEmail}`);
