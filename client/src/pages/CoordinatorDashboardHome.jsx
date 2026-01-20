@@ -3234,6 +3234,13 @@ const CoordinatorDashboardHome = () => {
     }
     return [];
   });
+
+  // Ref to always have access to the latest tickets state (avoids stale closure issues)
+  const ticketsRef = useRef(tickets);
+  useEffect(() => {
+    ticketsRef.current = tickets;
+  }, [tickets]);
+
   const [isInitialLoading, setIsInitialLoading] = useState(true); // Shows skeleton on first load only
   const [isEmailSyncing, setIsEmailSyncing] = useState(false); // Separate indicator for email sync
   const [toast, setToast] = useState(null);
@@ -4341,7 +4348,16 @@ const CoordinatorDashboardHome = () => {
 
     // If status changed to "assigned", send emails to all team members
     if (newStatus === 'assigned' && oldStatus !== 'assigned') {
-      const teamMembers = ticket.assignedInfo?.teamMembers || [];
+      // IMPORTANT: Use ticketsRef to get the LATEST ticket data (avoids stale closure issue)
+      // The 'ticket' parameter might be from an older render and not have the updated teamMembers
+      const latestTicket = ticketsRef.current.find(t => t._id === ticket._id);
+      const teamMembers = latestTicket?.assignedInfo?.teamMembers || [];
+
+      console.log('📧 Status changed to assigned, checking team members:', {
+        ticketId: ticket._id,
+        staleTeamMembers: ticket.assignedInfo?.teamMembers || [],
+        latestTeamMembers: teamMembers
+      });
 
       if (teamMembers.length > 0) {
         // Send emails to all team members

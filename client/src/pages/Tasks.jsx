@@ -2099,7 +2099,7 @@ const Tasks = () => {
                     ) : (
                       <>
                         {/* Table Header */}
-                        <div className="grid-cols-19 grid gap-x-3 px-3 py-1.5 bg-white border-b border-gray-200 text-[12px] font-bold text-gray-700">
+                        <div className="grid-cols-18 grid gap-x-3 px-3 py-1.5 bg-white border-b border-gray-200 text-[12px] font-bold text-gray-700">
                           <span className="col-span-1 truncate">Job ID</span>
                           <span className="col-span-3 truncate">Client</span>
                           <span className="col-span-1 truncate">Client Type</span>
@@ -2110,7 +2110,6 @@ const Tasks = () => {
                           <span className="col-span-2 truncate">Status</span>
                           <span className="col-span-1 truncate">Estimate</span>
                           <span className="col-span-2 truncate">Deadline</span>
-                          <span className="col-span-1 text-center truncate">Actions</span>
                           <span className="col-span-1 text-center">Mail</span>
                         </div>
 
