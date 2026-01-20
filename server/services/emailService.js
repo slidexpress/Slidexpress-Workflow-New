@@ -3,18 +3,23 @@ const { simpleParser } = require('mailparser');
 const Email = require('../models/Email');
 
 /* ───────────────────────── IMAP CONNECTION ───────────────────────── */
-const createImapConnection = (email, password) => new Imap({
-  user: email,
-  password,
-  host: 'imap.gmail.com',
-  port: 993,
-  tls: true,
-  tlsOptions: { rejectUnauthorized: false },
-  connTimeout: 15000,   // 15 seconds for connection (increased for reliability)
-  authTimeout: 15000,   // 15 seconds for authentication (increased for reliability)
-  socketTimeout: 15000, // 15 seconds for socket operations (increased for reliability)
-  keepalive: { interval: 10000, idleInterval: 300000 }
-});
+const createImapConnection = (email, password) => {
+  // Remove spaces from password (Gmail app passwords often have spaces like "xxxx xxxx xxxx xxxx")
+  const cleanedPassword = password.replace(/\s+/g, '');
+
+  return new Imap({
+    user: email,
+    password: cleanedPassword,
+    host: 'imap.gmail.com',
+    port: 993,
+    tls: true,
+    tlsOptions: { rejectUnauthorized: false },
+    connTimeout: 15000,   // 15 seconds for connection (increased for reliability)
+    authTimeout: 15000,   // 15 seconds for authentication (increased for reliability)
+    socketTimeout: 15000, // 15 seconds for socket operations (increased for reliability)
+    keepalive: { interval: 10000, idleInterval: 300000 }
+  });
+};
 
 /* ───────────────────────── STARRED EMAIL FETCH ───────────────────────── */
 const fetchStarredEmails = (email, password, workspaceId, userId) =>
