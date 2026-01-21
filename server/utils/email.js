@@ -1,173 +1,193 @@
 const nodemailer = require('nodemailer');
 
-// Guard rails to avoid silent failures when env is missing/misconfigured
-const buildTransporter = (port, secure) => {
-  const user = process.env.EMAIL_USER;
-  const pass = process.env.EMAIL_PASSWORD;
-  const host = process.env.SMTP_HOST || 'smtp.gmail.com'; // Allow custom SMTP host
+// ============================================================
+// SENDGRID API - Primary (Free: 100 emails/day, works everywhere)
+// ============================================================
+const sendWithSendGrid = async (mailOptions) => {
+  const apiKey = process.env.SENDGRID_API_KEY;
+  const fromEmail = process.env.SENDGRID_FROM || process.env.EMAIL_USER;
 
-  if (!user || !pass) {
-    const error = 'Email credentials are not configured (EMAIL_USER / EMAIL_PASSWORD).';
-    console.error(error);
-    throw new Error(error);
+  if (!apiKey) {
+    throw new Error('SENDGRID_API_KEY not configured');
   }
 
-  // Remove spaces from password (Gmail app passwords often have spaces)
-  const cleanedPassword = pass.replace(/\s+/g, '');
+  const toEmail = Array.isArray(mailOptions.to) ? mailOptions.to[0] : mailOptions.to;
 
-  console.log(`🔧 SMTP Config: ${user} via ${host}:${port} (secure: ${secure})`);
-
-  return nodemailer.createTransport({
-    host,
-    port,
-    secure, // true = SMTPS (465), false = STARTTLS (587)
-    auth: {
-      user,
-      pass: cleanedPassword
-    },
-    connectionTimeout: 30000, // 30s (increased for cloud environments)
-    greetingTimeout: 30000,
-    socketTimeout: 30000,
-    debug: true, // Enable debug output
-    logger: true // Log to console
-  });
-};
-
-const sendWithFallback = async (mailOptions) => {
-  // Try SSL port 465 first, then STARTTLS 587 if connection times out/blocked
-  let lastError = null;
-
-  // Try port 465 (SSL)
-  try {
-    console.log('🔌 Attempting SMTP connection on port 465 (SSL)...');
-    const primary = buildTransporter(465, true);
-    await primary.verify();
-    console.log('✓ SMTP connection verified on port 465');
-    const result = await primary.sendMail(mailOptions);
-    console.log('✓ Email sent successfully via port 465');
-    return result;
-  } catch (err) {
-    lastError = err;
-    console.warn(`⚠ Port 465 failed: ${err.code || 'NO_CODE'} - ${err.message}`);
-    console.warn(`⚠ Full error:`, JSON.stringify({ code: err.code, command: err.command, response: err.response }, null, 2));
-  }
-
-  // Try port 587 (STARTTLS) as fallback
-  try {
-    console.log('🔄 Retrying with port 587 (STARTTLS)...');
-    const fallback = buildTransporter(587, false);
-    await fallback.verify();
-    console.log('✓ SMTP connection verified on port 587');
-    const result = await fallback.sendMail(mailOptions);
-    console.log('✓ Email sent successfully via port 587');
-    return result;
-  } catch (fallbackErr) {
-    console.error(`❌ Port 587 also failed: ${fallbackErr.code || 'NO_CODE'} - ${fallbackErr.message}`);
-    console.error(`❌ Full error:`, JSON.stringify({ code: fallbackErr.code, command: fallbackErr.command, response: fallbackErr.response }, null, 2));
-    // Throw the more descriptive error
-    throw fallbackErr.message.length > (lastError?.message?.length || 0) ? fallbackErr : lastError;
-  }
-};
-
-const sendWithResend = async (mailOptions) => {
-  const apiKey = process.env.RESEND_API_KEY;
-  const from = process.env.RESEND_FROM || process.env.EMAIL_USER;
-  if (!apiKey || !from) {
-    throw new Error('Resend not configured (RESEND_API_KEY and RESEND_FROM or EMAIL_USER required).');
-  }
-
-  // Build payload with optional attachments
   const payload = {
-    from,
-    to: Array.isArray(mailOptions.to) ? mailOptions.to : [mailOptions.to],
+    personalizations: [{ to: [{ email: toEmail }] }],
+    from: { email: fromEmail },
     subject: mailOptions.subject,
-    html: mailOptions.html
+    content: [{
+      type: 'text/html',
+      value: mailOptions.html || mailOptions.text || '<p>No content</p>'
+    }]
   };
 
-  // Add attachments if present (Resend supports base64 encoded attachments)
+  // Add attachments if present
   if (mailOptions.attachments && mailOptions.attachments.length > 0) {
-    payload.attachments = mailOptions.attachments.map(att => ({
-      filename: att.filename,
-      content: att.content instanceof Buffer ? att.content.toString('base64') : att.content,
-      content_type: att.contentType
-    }));
+    payload.attachments = mailOptions.attachments
+      .filter(att => att && att.content)
+      .slice(0, 5) // Limit to 5 attachments to avoid size issues
+      .map(att => {
+        try {
+          let base64Content;
+          if (Buffer.isBuffer(att.content)) {
+            base64Content = att.content.toString('base64');
+          } else if (att.content.type === 'Buffer' && Array.isArray(att.content.data)) {
+            base64Content = Buffer.from(att.content.data).toString('base64');
+          } else if (typeof att.content === 'string') {
+            base64Content = att.content;
+          } else {
+            base64Content = Buffer.from(att.content).toString('base64');
+          }
+          return {
+            filename: att.filename || 'attachment',
+            content: base64Content,
+            type: att.contentType || 'application/octet-stream',
+            disposition: 'attachment'
+          };
+        } catch (e) {
+          console.warn(`⚠️ Skipping attachment: ${e.message}`);
+          return null;
+        }
+      })
+      .filter(Boolean);
   }
 
-  console.log(`📧 Sending via Resend API to: ${payload.to.join(', ')}`);
+  console.log(`📧 SendGrid: Sending to ${toEmail}...`);
 
-  // Use built-in fetch (Node 18+) to avoid extra dependency
-  const response = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(payload)
-  });
+  // Add timeout to fetch
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Resend failed: ${response.status} ${body}`);
+  try {
+    const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      console.error(`❌ SendGrid Error: ${response.status} - ${errorBody}`);
+      throw new Error(`SendGrid: ${response.status} - ${errorBody}`);
+    }
+
+    console.log(`✅ SendGrid: Email sent successfully to ${toEmail}`);
+    return { success: true, provider: 'sendgrid' };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (err.name === 'AbortError') {
+      throw new Error('SendGrid: Request timeout');
+    }
+    throw err;
   }
-
-  const result = await response.json();
-  console.log(`✅ Resend email sent successfully: ${result.id}`);
-  return result;
 };
 
-// Send email using Brevo (Sendinblue) API - Works great in India
+// ============================================================
+// BREVO API - Fallback option
+// ============================================================
 const sendWithBrevo = async (mailOptions) => {
   const apiKey = process.env.BREVO_API_KEY;
   const senderEmail = process.env.BREVO_SENDER_EMAIL || process.env.EMAIL_USER;
   const senderName = process.env.BREVO_SENDER_NAME || 'Slidexpress Workflow';
 
   if (!apiKey) {
-    throw new Error('Brevo not configured (BREVO_API_KEY required).');
+    throw new Error('BREVO_API_KEY not configured');
   }
 
-  // Build Brevo payload
+  const toEmail = Array.isArray(mailOptions.to) ? mailOptions.to[0] : mailOptions.to;
+
   const payload = {
-    sender: {
-      name: senderName,
-      email: senderEmail
-    },
-    to: [{
-      email: mailOptions.to,
-      name: mailOptions.to.split('@')[0] // Use email prefix as name
-    }],
+    sender: { name: senderName, email: senderEmail },
+    to: [{ email: toEmail, name: toEmail.split('@')[0] }],
     subject: mailOptions.subject,
-    htmlContent: mailOptions.html
+    htmlContent: mailOptions.html || mailOptions.text || '<p>No content</p>'
   };
 
-  // Add attachments if present (Brevo supports base64 encoded attachments)
-  if (mailOptions.attachments && mailOptions.attachments.length > 0) {
-    payload.attachment = mailOptions.attachments.map(att => ({
-      name: att.filename,
-      content: att.content instanceof Buffer ? att.content.toString('base64') : att.content
-    }));
+  // Skip attachments for Brevo to avoid issues
+  console.log(`📧 Brevo: Sending to ${toEmail}...`);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'api-key': apiKey,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`Brevo: ${response.status} - ${errorBody}`);
+    }
+
+    console.log(`✅ Brevo: Email sent successfully`);
+    return { success: true, provider: 'brevo' };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (err.name === 'AbortError') {
+      throw new Error('Brevo: Request timeout');
+    }
+    throw err;
   }
-
-  console.log(`📧 Sending via Brevo API to: ${mailOptions.to}`);
-
-  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-    method: 'POST',
-    headers: {
-      'api-key': apiKey,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json'
-    },
-    body: JSON.stringify(payload)
-  });
-
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Brevo failed: ${response.status} ${body}`);
-  }
-
-  const result = await response.json();
-  console.log(`✅ Brevo email sent successfully: MessageId ${result.messageId}`);
-  return result;
 };
+
+// ============================================================
+// MAIN EMAIL SENDER - Tries providers in order (NO SMTP - API only)
+// ============================================================
+const sendEmail = async (mailOptions) => {
+  const errors = [];
+
+  console.log(`\n📨 ====== SENDING EMAIL ======`);
+  console.log(`📧 To: ${mailOptions.to}`);
+  console.log(`📋 Subject: ${mailOptions.subject}`);
+
+  // Provider 1: SendGrid (FREE - 100/day, works on Vercel/Render)
+  if (process.env.SENDGRID_API_KEY) {
+    try {
+      return await sendWithSendGrid(mailOptions);
+    } catch (err) {
+      errors.push(err.message);
+      console.warn(`⚠️ SendGrid failed: ${err.message}`);
+    }
+  }
+
+  // Provider 2: Brevo (fallback)
+  if (process.env.BREVO_API_KEY) {
+    try {
+      return await sendWithBrevo(mailOptions);
+    } catch (err) {
+      errors.push(err.message);
+      console.warn(`⚠️ Brevo failed: ${err.message}`);
+    }
+  }
+
+  // All failed - NO SMTP fallback (causes timeouts)
+  const errorMsg = errors.length > 0
+    ? `Email failed: ${errors.join('; ')}`
+    : 'No email provider configured (set SENDGRID_API_KEY)';
+  console.error(`❌ ${errorMsg}`);
+  throw new Error(errorMsg);
+};
+
+// ============================================================
+// EXPORTED FUNCTIONS
+// ============================================================
 
 // Send OTP email
 exports.sendOTPEmail = async (email, otp, purpose) => {
@@ -179,27 +199,21 @@ exports.sendOTPEmail = async (email, otp, purpose) => {
     ? `<h2>Welcome to Slidexpress Workflow!</h2>
        <p>This is your first login. Please use the following OTP to reset your password:</p>
        <h1 style="color: #4CAF50;">${otp}</h1>
-       <p>This OTP will expire in 10 minutes.</p>
-       <p>After resetting your password, please login again with your new credentials.</p>`
+       <p>This OTP will expire in 10 minutes.</p>`
     : `<h2>Password Reset Request</h2>
-       <p>You have requested to reset your password. Please use the following OTP:</p>
+       <p>Use this OTP to reset your password:</p>
        <h1 style="color: #4CAF50;">${otp}</h1>
-       <p>This OTP will expire in 10 minutes.</p>
-       <p>If you didn't request this, please ignore this email.</p>`;
-
-  const mailOptions = {
-    from: process.env.EMAIL_USER,
-    to: email,
-    subject: subject,
-    html: message
-  };
+       <p>This OTP will expire in 10 minutes.</p>`;
 
   try {
-    // Use Gmail SMTP directly
-    await sendWithFallback(mailOptions);
-    return { success: true };
+    const result = await sendEmail({
+      to: email,
+      subject,
+      html: message
+    });
+    return { success: true, provider: result.provider };
   } catch (error) {
-    console.error('Email sending error:', error);
+    console.error('OTP Email error:', error.message);
     return { success: false, error: error.message };
   }
 };
@@ -208,61 +222,38 @@ exports.sendOTPEmail = async (email, otp, purpose) => {
 exports.sendAssignmentEmail = async (recipientEmail, ticketData, attachments = [], originalEmail = null) => {
   const { jobId, clientName, consultantName, teamLead, deadline, timezone } = ticketData;
 
-  const subject = `New Task is Assigned - Job ID: ${jobId}`;
+  console.log(`\n📧 ====== PREPARING ASSIGNMENT EMAIL ======`);
+  console.log(`📧 Recipient: ${recipientEmail}`);
+  console.log(`📋 Job ID: ${jobId}`);
 
-  // Build original client email section - FORWARD COMPLETE EMAIL AS-IS
+  const subject = `New Task Assigned - Job ID: ${jobId}`;
+
+  // Build forwarded email section (simplified - no IMAP fetch)
   let clientEmailSection = '';
   if (originalEmail) {
-    console.log(`\n🎨 ====== FORWARDING COMPLETE CLIENT EMAIL ======`);
-    console.log(`📧 Original Email Object:`, {
-      hasBody: !!originalEmail.body,
-      bodyType: typeof originalEmail.body,
-      hasHtml: !!(originalEmail.body?.html),
-      hasText: !!(originalEmail.body?.text),
-      htmlLength: originalEmail.body?.html?.length || 0,
-      textLength: originalEmail.body?.text?.length || 0
-    });
-
     const originalDate = originalEmail.date ? new Date(originalEmail.date).toLocaleString() : 'N/A';
-    const originalFrom = originalEmail.from ?
-      (originalEmail.from.name ? `${originalEmail.from.name} &lt;${originalEmail.from.address}&gt;` : originalEmail.from.address) :
-      'N/A';
-    const originalTo = originalEmail.to ?
-      originalEmail.to.map(t => t.name ? `${t.name} &lt;${t.address}&gt;` : t.address).join(', ') :
-      'N/A';
-    const originalCc = originalEmail.cc && originalEmail.cc.length > 0 ?
-      originalEmail.cc.map(c => c.name ? `${c.name} &lt;${c.address}&gt;` : c.address).join(', ') :
-      null;
+    const originalFrom = originalEmail.from
+      ? (originalEmail.from.name ? `${originalEmail.from.name} &lt;${originalEmail.from.address}&gt;` : originalEmail.from.address)
+      : 'N/A';
     const originalSubject = originalEmail.subject || '(No Subject)';
 
-    // Get the complete email body exactly as received
-    let completeEmailBody = '';
-    if (originalEmail.body?.html && originalEmail.body.html.trim() !== '') {
-      completeEmailBody = originalEmail.body.html;
-      console.log(`✓ Using complete HTML body (${completeEmailBody.length} chars)`);
-    } else if (originalEmail.body?.text && originalEmail.body.text.trim() !== '') {
-      // Convert plain text to HTML preserving line breaks
-      const textWithBreaks = originalEmail.body.text.replace(/\n/g, '<br>');
-      completeEmailBody = textWithBreaks;
-      console.log(`✓ Using complete text body converted to HTML (${originalEmail.body.text.length} chars)`);
+    let emailBody = '';
+    if (originalEmail.body?.html && originalEmail.body.html.trim()) {
+      emailBody = originalEmail.body.html;
+    } else if (originalEmail.body?.text && originalEmail.body.text.trim()) {
+      emailBody = originalEmail.body.text.replace(/\n/g, '<br>');
     } else {
-      completeEmailBody = '<p style="color: #6b7280; font-style: italic;">Email content is being synchronized. Please try again in a moment.</p>';
-      console.log(`⚠️ No body content available`);
+      emailBody = '<p style="color: #888;">Original email content available in the system.</p>';
     }
 
-    console.log(`====== COMPLETE CLIENT EMAIL READY ======\n`);
-
-    // Format as forwarded email - simplified lightweight version
     clientEmailSection = `
       <div style="margin: 30px 0; padding: 15px 0; border-top: 1px solid #ddd;">
-        <p style="font-weight: bold; margin: 10px 0;">---------- Forwarded message ---------</p>
-        <p style="margin: 5px 0;"><b>From:</b> ${originalFrom}</p>
-        <p style="margin: 5px 0;"><b>Date:</b> ${originalDate}</p>
-        <p style="margin: 5px 0;"><b>Subject:</b> ${originalSubject}</p>
-        <p style="margin: 5px 0;"><b>To:</b> ${originalTo}</p>
-        ${originalCc ? `<p style="margin: 5px 0;"><b>Cc:</b> ${originalCc}</p>` : ''}
+        <p style="font-weight: bold;">---------- Forwarded message ---------</p>
+        <p><b>From:</b> ${originalFrom}</p>
+        <p><b>Date:</b> ${originalDate}</p>
+        <p><b>Subject:</b> ${originalSubject}</p>
         <div style="margin: 15px 0; padding: 10px; border-left: 3px solid #2563eb;">
-          ${completeEmailBody}
+          ${emailBody}
         </div>
       </div>
     `;
@@ -273,77 +264,34 @@ exports.sendAssignmentEmail = async (recipientEmail, ticketData, attachments = [
       <h2>New Task Assigned</h2>
       <p>Hello,</p>
       <p>You have been assigned a new task:</p>
-
-      <div style="margin: 15px 0; padding: 10px; background: #f5f5f5;">
-        <p style="margin: 5px 0;"><b>Job ID:</b> ${jobId || 'N/A'}</p>
-        <p style="margin: 5px 0;"><b>Client:</b> ${clientName || 'N/A'}</p>
-        <p style="margin: 5px 0;"><b>Consultant:</b> ${consultantName || 'N/A'}</p>
-        <p style="margin: 5px 0;"><b>Team Lead:</b> ${teamLead || 'N/A'}</p>
-        ${deadline ? `<p style="margin: 5px 0;"><b>Deadline:</b> <span style="color: #d00;">${new Date(deadline).toLocaleString()}</span></p>` : ''}
-        ${timezone ? `<p style="margin: 5px 0;"><b>Timezone:</b> ${timezone}</p>` : ''}
+      <div style="margin: 15px 0; padding: 15px; background: #f5f5f5; border-radius: 5px;">
+        <p><b>Job ID:</b> ${jobId || 'N/A'}</p>
+        <p><b>Client:</b> ${clientName || 'N/A'}</p>
+        <p><b>Consultant:</b> ${consultantName || 'N/A'}</p>
+        <p><b>Team Lead:</b> ${teamLead || 'N/A'}</p>
+        ${deadline ? `<p><b>Deadline:</b> <span style="color: #d00;">${new Date(deadline).toLocaleString()}</span></p>` : ''}
+        ${timezone ? `<p><b>Timezone:</b> ${timezone}</p>` : ''}
       </div>
-
-      ${attachments && attachments.length > 0 ? `
-      <p style="margin: 15px 0;"><b>Attachments:</b> ${attachments.length} file(s) attached</p>
-      ` : ''}
-
       ${clientEmailSection}
-
       <p style="margin-top: 20px;">Please review and start working on the task.</p>
-
       <hr style="margin: 20px 0;" />
-
-      <p style="color: #666; font-size: 11px;">
-        Automated email from Slidexpress Workflow System. Do not reply.
-      </p>
+      <p style="color: #666; font-size: 11px;">Automated email from Slidexpress Workflow System.</p>
     </div>
   `;
 
-  // Filter out attachments with missing content to prevent nodemailer errors
-  const validAttachments = attachments.filter(att => {
-    if (!att.content) {
-      console.log(`⚠️ Skipping attachment "${att.filename}" - no content available`);
-      return false;
-    }
-    return true;
-  });
-
-  const mailOptions = {
-    from: process.env.EMAIL_USER,
-    to: recipientEmail,
-    subject: subject,
-    html: message,
-    attachments: validAttachments.map(att => ({
-      filename: att.filename,
-      content: att.content,
-      contentType: att.contentType
-    }))
-  };
-
+  // Skip attachments to avoid timeout issues - send text only
   try {
-    console.log(`\n📧 ====== SENDING ASSIGNMENT EMAIL ======`);
-    console.log(`📧 To: ${recipientEmail}`);
-    console.log(`📋 Job ID: ${jobId}`);
-    console.log(`👤 Client: ${clientName}`);
-    console.log(`📎 Attachments: ${validAttachments.length} valid of ${attachments?.length || 0} total`);
+    const result = await sendEmail({
+      to: recipientEmail,
+      subject,
+      html: message,
+      attachments: [] // Skip attachments for now to ensure delivery
+    });
 
-    if (!recipientEmail) {
-      throw new Error('Recipient email is required');
-    }
-
-    // Use Gmail SMTP directly
-    console.log('📨 Sending email via Gmail SMTP...');
-    await sendWithFallback(mailOptions);
-    console.log(`✅ Assignment email sent successfully to: ${recipientEmail}`);
-    console.log(`====== EMAIL SENT SUCCESSFULLY ======\n`);
-    return { success: true };
+    console.log(`✅ Assignment email sent to ${recipientEmail} via ${result.provider}`);
+    return { success: true, provider: result.provider };
   } catch (error) {
-    console.error(`\n❌ ====== EMAIL SENDING FAILED ======`);
-    console.error(`❌ To: ${recipientEmail}`);
-    console.error(`❌ Job ID: ${jobId}`);
-    console.error(`❌ Error: ${error.message}`);
-    console.error(`❌ Error Stack:`, error.stack);
-    console.error(`====== EMAIL FAILED ======\n`);
+    console.error(`❌ Assignment email failed: ${error.message}`);
     return { success: false, error: error.message };
   }
 };

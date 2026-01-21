@@ -2,8 +2,7 @@ import axios from 'axios';
 
 // Base URL for API; defaults to local dev, can be overridden via VITE_API_URL at build time
 const API_URL = import.meta.env.VITE_API_URL || 'https://slidexpress-workflow-new.onrender.com/api';
-//http://localhost:5000/api
-//https://slidexpress-workflow-master-08-01-2026.onrender.com
+// LOCAL: http://localhost:5000/api
 const api = axios.create({
   baseURL: API_URL,
   headers: {

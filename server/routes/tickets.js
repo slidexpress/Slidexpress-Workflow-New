@@ -371,7 +371,7 @@ router.post('/:id/assign', async (req, res) => {
 });
 
 // Send assignment email with attachments
-// This endpoint sends the complete client email (body, attachments, formatting) to the team member
+// SIMPLIFIED: No IMAP fetch - uses only cached data to avoid timeouts
 router.post('/:id/send-assignment-email', async (req, res) => {
   try {
     const { empName } = req.body;
@@ -380,41 +380,32 @@ router.post('/:id/send-assignment-email', async (req, res) => {
     console.log(`👤 Employee: ${empName}`);
 
     if (!empName) {
-      console.log('❌ Employee name is missing');
       return res.status(400).json({ message: 'Employee name is required' });
     }
 
     // Get ticket details
     const ticket = await Ticket.findById(req.params.id);
     if (!ticket) {
-      console.log(`❌ Ticket not found: ${req.params.id}`);
       return res.status(404).json({ message: 'Ticket not found' });
     }
-    console.log(`✓ Ticket found: ${ticket.jobId}`);
 
-    // Get team member email - use case-insensitive regex match with trimmed name
+    // Get team member email
     const trimmedName = empName.trim();
-    console.log(`🔍 Looking up team member: "${trimmedName}"`);
-
     let teamMember = await TeamMember.findOne({ name: trimmedName });
 
-    // If exact match fails, try case-insensitive search
+    // Try case-insensitive search
     if (!teamMember) {
-      console.log(`⚠️ Exact match failed for "${trimmedName}", trying case-insensitive search...`);
       teamMember = await TeamMember.findOne({
         name: { $regex: new RegExp(`^${trimmedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }
       });
     }
 
-    // If still not found, this might be a team lead - search by tlName
+    // Check if it's a team lead
     if (!teamMember) {
-      console.log(`⚠️ Not found by name, checking if "${trimmedName}" is a team lead...`);
       const memberUnderThisTL = await TeamMember.findOne({
         tlName: { $regex: new RegExp(`^${trimmedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }
       });
-
       if (memberUnderThisTL) {
-        console.log(`✓ Found "${trimmedName}" as a team lead (tlName). Looking for their own record...`);
         teamMember = await TeamMember.findOne({
           name: { $regex: new RegExp(`^${memberUnderThisTL.tlName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }
         });
@@ -422,27 +413,20 @@ router.post('/:id/send-assignment-email', async (req, res) => {
     }
 
     if (!teamMember) {
-      console.log(`❌ Team member not found in database: ${empName}`);
-      const allMembers = await TeamMember.find().select('name tlName emailId').lean();
-      console.log(`📋 Available team members in database:`);
-      allMembers.forEach(m => console.log(`   - "${m.name}" (TL: ${m.tlName}, Email: ${m.emailId || 'NOT SET'})`));
-
       return res.status(404).json({
-        message: `Team member not found: ${empName}. Please ensure the team member exists in the system with an email address configured.`
+        message: `Team member not found: ${empName}`
       });
     }
 
     if (!teamMember.emailId) {
-      console.log(`❌ Team member exists but has no email: ${empName}`);
       return res.status(400).json({
-        message: `Email address not configured for team member: ${empName}. Please add an email address in Team Members settings.`
+        message: `Email not configured for: ${empName}. Add email in Team Settings.`
       });
     }
 
-    console.log(`✓ Team member found: ${teamMember.name}`);
-    console.log(`✓ Email address: ${teamMember.emailId}`);
+    console.log(`✓ Sending to: ${teamMember.emailId}`);
 
-    // Prepare ticket data for email
+    // Prepare ticket data
     const ticketData = {
       jobId: ticket.jobId,
       clientName: ticket.clientName,
@@ -452,155 +436,35 @@ router.post('/:id/send-assignment-email', async (req, res) => {
       timezone: ticket.meta?.timezone
     };
 
-    // Get attachments and original email from emails associated with this job
-    let attachments = [];
+    // Get original email from database (NO IMAP fetch - use cached only)
     let originalEmail = null;
-
     if (ticket.jobId) {
-      const emails = await Email.find({ jobId: ticket.jobId }).limit(5);
-
-      // Get the original starred email (first email in the list)
-      if (emails.length > 0) {
-        originalEmail = emails[0];
-        console.log(`✓ Found original email: ${originalEmail.subject}`);
-      }
-
-      // Collect attachments from all emails (limit to avoid huge emails)
-      for (const email of emails) {
-        if (email.attachments && email.attachments.length > 0) {
-          // Filter out inline images and attachments without content
-          const fileAttachments = email.attachments
-            .filter(att => !att.contentId && att.content) // Exclude inline images AND missing content
-            .slice(0, 5) // Limit attachments per email
-            .map(att => ({
-              filename: att.filename,
-              content: att.content,
-              contentType: att.contentType
-            }));
-
-          console.log(`📎 Found ${fileAttachments.length} valid file attachments in email "${email.subject}" (${email.attachments.length} total)`);
-          attachments = attachments.concat(fileAttachments);
-
-          // Limit total attachments to avoid email size issues
-          if (attachments.length >= 10) {
-            attachments = attachments.slice(0, 10);
-            break;
-          }
-        }
-      }
-      console.log(`📎 Total attachments collected from emails: ${attachments.length}`);
+      originalEmail = await Email.findOne({ jobId: ticket.jobId }).lean();
     }
-
-    // If no email found by jobId, try to fetch by messageId
     if (!originalEmail && ticket.messageId) {
-      console.log(`⚠️ No email found by jobId, trying messageId: ${ticket.messageId}`);
-      originalEmail = await Email.findOne({ messageId: ticket.messageId });
-      if (originalEmail) {
-        console.log(`✓ Found original email by messageId: ${originalEmail.subject}`);
-      }
+      originalEmail = await Email.findOne({ messageId: ticket.messageId }).lean();
     }
 
-    // Fetch email body if not cached (this ensures message content is available)
-    if (originalEmail && (!originalEmail.body || (!originalEmail.body.html && !originalEmail.body.text))) {
-      console.log(`⚠️ Email body not cached, fetching from Gmail...`);
-      const { fetchFullEmailByUid } = require('../services/emailService');
-
-      try {
-        if (originalEmail.uid) {
-          const fullEmailData = await fetchFullEmailByUid(
-            process.env.EMAIL_USER,
-            process.env.EMAIL_PASSWORD,
-            originalEmail.uid
-          );
-
-          if (fullEmailData && (fullEmailData.body?.html || fullEmailData.body?.text)) {
-            console.log(`✓ Fetched email body from Gmail (HTML: ${fullEmailData.body.html?.length || 0} chars, Text: ${fullEmailData.body.text?.length || 0} chars)`);
-
-            // Update the email in database for future use
-            await Email.findByIdAndUpdate(originalEmail._id, {
-              body: fullEmailData.body,
-              attachments: fullEmailData.attachments || originalEmail.attachments,
-              hasAttachments: (fullEmailData.attachments || []).length > 0
-            });
-
-            // Update our local originalEmail object with the fetched body
-            originalEmail.body = fullEmailData.body;
-
-            // Also collect attachments from the fetched email
-            if (fullEmailData.attachments && fullEmailData.attachments.length > 0) {
-              const fetchedAttachments = fullEmailData.attachments
-                .filter(att => !att.contentId && att.content) // Exclude inline images AND missing content
-                .slice(0, 10)
-                .map(att => ({
-                  filename: att.filename,
-                  content: att.content,
-                  contentType: att.contentType
-                }));
-
-              console.log(`📎 Found ${fetchedAttachments.length} valid attachments in fetched email body (${fullEmailData.attachments.length} total)`);
-
-              // Merge with existing attachments, avoiding duplicates by filename
-              const existingFilenames = new Set(attachments.map(a => a.filename));
-              const newAttachments = fetchedAttachments.filter(a => !existingFilenames.has(a.filename));
-
-              if (newAttachments.length > 0) {
-                console.log(`📎 Adding ${newAttachments.length} new attachments from fetched email`);
-                attachments = [...attachments, ...newAttachments].slice(0, 10); // Limit to 10 total
-              }
-            }
-          }
-        } else {
-          console.log(`⚠️ Email has no UID, cannot fetch body from Gmail`);
-        }
-      } catch (error) {
-        console.error(`❌ Failed to fetch email body from Gmail:`, error.message);
-        // Continue anyway - the email will be sent without the body content
-      }
-    } else if (originalEmail && originalEmail.body) {
-      console.log(`✓ Email body already cached (HTML: ${originalEmail.body.html?.length || 0} chars, Text: ${originalEmail.body.text?.length || 0} chars)`);
-    }
-
-    // Send email with original starred email forwarded
-    console.log(`\n📨 ====== ASSIGNMENT EMAIL DEBUG INFO ======`);
-    console.log(`📧 Team Member Email: ${teamMember.emailId}`);
-    console.log(`📋 Job ID: ${ticket.jobId}`);
-    console.log(`📎 Attachments Count: ${attachments.length}`);
-    console.log(`📬 Original Email Present: ${originalEmail ? 'Yes' : 'No'}`);
-    if (originalEmail) {
-      console.log(`   - Subject: ${originalEmail.subject}`);
-      console.log(`   - From: ${originalEmail.from?.address || originalEmail.from?.name || 'N/A'}`);
-      console.log(`   - Body HTML Length: ${originalEmail.body?.html?.length || 0} chars`);
-      console.log(`   - Body Text Length: ${originalEmail.body?.text?.length || 0} chars`);
-      console.log(`   - Body Structure:`, JSON.stringify({
-        hasBody: !!originalEmail.body,
-        hasHtml: !!(originalEmail.body?.html),
-        hasText: !!(originalEmail.body?.text),
-        htmlPreview: originalEmail.body?.html?.substring(0, 100) || 'N/A',
-        textPreview: originalEmail.body?.text?.substring(0, 100) || 'N/A'
-      }, null, 2));
-    }
-    console.log(`====== DEBUG INFO END ======\n`);
-
-    const result = await sendAssignmentEmail(teamMember.emailId, ticketData, attachments, originalEmail);
+    // Send email (no attachments to avoid size issues)
+    const result = await sendAssignmentEmail(teamMember.emailId, ticketData, [], originalEmail);
 
     if (result.success) {
-      console.log(`✅ Assignment email sent successfully to ${teamMember.emailId}`);
+      console.log(`✅ Email sent to ${teamMember.emailId} via ${result.provider}`);
       res.json({
-        message: `Assignment email sent successfully to ${teamMember.emailId}`,
-        attachmentCount: attachments.length
+        message: `Email sent successfully to ${teamMember.emailId}`,
+        provider: result.provider
       });
     } else {
-      console.log(`❌ Failed to send assignment email: ${result.error}`);
+      console.log(`❌ Failed: ${result.error}`);
       res.status(500).json({
-        message: `Failed to send assignment email: ${result.error}`,
-        error: result.error,
-        recipient: teamMember.emailId
+        message: `Failed to send email: ${result.error}`,
+        error: result.error
       });
     }
   } catch (err) {
     console.error('Send assignment email error:', err);
     res.status(500).json({
-      message: `Error sending assignment email: ${err.message}`,
+      message: `Error: ${err.message}`,
       error: err.message
     });
   }
