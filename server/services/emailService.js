@@ -4,7 +4,6 @@ const Email = require('../models/Email');
 
 /* ───────────────────────── IMAP CONNECTION ───────────────────────── */
 const createImapConnection = (email, password) => {
-  // Remove spaces from password (Gmail app passwords often have spaces like "xxxx xxxx xxxx xxxx")
   const cleanedPassword = password.replace(/\s+/g, '');
 
   return new Imap({
@@ -14,37 +13,91 @@ const createImapConnection = (email, password) => {
     port: 993,
     tls: true,
     tlsOptions: { rejectUnauthorized: false },
-    connTimeout: 30000,   // 30 seconds for connection (increased for cloud environments)
-    authTimeout: 30000,   // 30 seconds for authentication (increased for cloud environments)
-    socketTimeout: 30000, // 30 seconds for socket operations (increased for cloud environments)
+    connTimeout: 60000,   // 60 seconds
+    authTimeout: 60000,   // 60 seconds
+    socketTimeout: 60000, // 60 seconds
     keepalive: { interval: 10000, idleInterval: 300000 }
   });
 };
 
+/* ───────────────────────── FETCH WITH RETRY ───────────────────────── */
+const fetchWithRetry = async (fetchFn, maxRetries = 3) => {
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`📧 IMAP attempt ${attempt}/${maxRetries}...`);
+      return await fetchFn();
+    } catch (err) {
+      lastError = err;
+      console.warn(`⚠️ Attempt ${attempt} failed: ${err.message}`);
+      if (attempt < maxRetries) {
+        await new Promise(r => setTimeout(r, 2000)); // Wait 2 seconds before retry
+      }
+    }
+  }
+  throw lastError;
+};
+
 /* ───────────────────────── STARRED EMAIL FETCH ───────────────────────── */
 const fetchStarredEmails = (email, password, workspaceId, userId) =>
-  new Promise((resolve, reject) => {
+  fetchWithRetry(() => new Promise((resolve, reject) => {
     const imap = createImapConnection(email, password);
     const emails = [];
+    let isResolved = false;
+
+    // 90 second overall timeout
+    const timeout = setTimeout(() => {
+      if (!isResolved) {
+        isResolved = true;
+        try { imap.end(); } catch (e) {}
+        reject(new Error('IMAP connection timeout after 90 seconds'));
+      }
+    }, 90000);
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      try { imap.end(); } catch (e) {}
+    };
 
     const sinceDate = new Date();
-    sinceDate.setMonth(sinceDate.getMonth() - 1); // last 1 month
-    const imapSince = sinceDate.toISOString().split('T')[0]; // YYYY-MM-DD
+    sinceDate.setMonth(sinceDate.getMonth() - 1);
+    const imapSince = sinceDate.toISOString().split('T')[0];
 
     imap.once('ready', () => {
+      console.log('✓ IMAP connected');
       imap.openBox('INBOX', false, err => {
-        if (err) return reject(err);
+        if (err) {
+          cleanup();
+          if (!isResolved) {
+            isResolved = true;
+            return reject(err);
+          }
+          return;
+        }
 
+        console.log('✓ INBOX opened, searching for starred emails...');
         imap.search(['FLAGGED', ['SINCE', imapSince]], (err, results) => {
-          if (err || !results.length) {
-            imap.end();
-            return resolve([]);
+          if (err) {
+            cleanup();
+            if (!isResolved) {
+              isResolved = true;
+              return reject(err);
+            }
+            return;
           }
 
-          const fetch = imap.fetch(results, {
-            bodies: '',
-            struct: true
-          });
+          if (!results || !results.length) {
+            console.log('✓ No starred emails found');
+            cleanup();
+            if (!isResolved) {
+              isResolved = true;
+              resolve([]);
+            }
+            return;
+          }
+
+          console.log(`✓ Found ${results.length} starred emails`);
+          const fetch = imap.fetch(results, { bodies: '', struct: true });
 
           fetch.on('message', msg => {
             const emailData = {
@@ -57,32 +110,27 @@ const fetchStarredEmails = (email, password, workspaceId, userId) =>
             msg.on('body', stream => {
               simpleParser(stream, (err, parsed) => {
                 if (err) {
-                  console.error('Error parsing email stream:', err);
+                  console.error('Parse error:', err.message);
                   return;
                 }
 
-                // Extract headers
                 const h = parsed.headers;
                 emailData.messageId = h.get('message-id');
                 emailData.subject = parsed.subject || '(No Subject)';
                 emailData.date = parsed.date || new Date();
 
                 const from = parsed.from?.value?.[0];
-                if (from) {
-                  emailData.from = { name: from.name || '', address: from.address || '' };
-                } else {
-                  emailData.from = { name: '', address: '' };
-                }
+                emailData.from = from
+                  ? { name: from.name || '', address: from.address || '' }
+                  : { name: '', address: '' };
 
                 emailData.references = parsed.references || [];
                 emailData.threadId = parsed.inReplyTo || emailData.references[0] || emailData.messageId;
-
-                // Extract body and attachments
                 emailData.body = { html: parsed.html || '', text: parsed.text || '' };
                 emailData.attachments = (parsed.attachments || []).map(a => ({
                   filename: a.filename,
                   contentType: a.contentType,
-                  content: a.content // This will be a Buffer
+                  content: a.content
                 }));
                 emailData.hasAttachments = emailData.attachments.length > 0;
               });
@@ -92,67 +140,87 @@ const fetchStarredEmails = (email, password, workspaceId, userId) =>
               emailData.uid = attrs.uid;
             });
 
-            msg.once('end', () => emails.push(emailData));
+            msg.once('end', () => {
+              if (emailData.messageId) {
+                emails.push(emailData);
+              }
+            });
           });
 
           fetch.once('end', () => {
-            imap.end();
-            resolve(emails);
+            console.log(`✓ Fetched ${emails.length} emails`);
+            cleanup();
+            if (!isResolved) {
+              isResolved = true;
+              resolve(emails);
+            }
           });
 
-          fetch.once('error', reject);
+          fetch.once('error', err => {
+            cleanup();
+            if (!isResolved) {
+              isResolved = true;
+              reject(err);
+            }
+          });
         });
       });
     });
 
-    imap.once('error', reject);
-    imap.connect();
-  });
-
-/* ───────────────────────── ATTACHMENTS DETECTION ───────────────────────── */
-const checkAttachments = (struct) => {
-  if (!struct) return false;
-  if (Array.isArray(struct)) {
-    return struct.some(item => {
-      if (item.disposition && item.disposition.type.toUpperCase() === 'ATTACHMENT') return true;
-      if (item.parts) return checkAttachments(item.parts);
-      return false;
+    imap.once('error', err => {
+      cleanup();
+      if (!isResolved) {
+        isResolved = true;
+        reject(new Error(`IMAP error: ${err.message}`));
+      }
     });
-  }
-  return false;
-};
+
+    imap.once('close', () => {
+      if (!isResolved) {
+        isResolved = true;
+        resolve(emails);
+      }
+    });
+
+    try {
+      console.log('📧 Connecting to Gmail IMAP...');
+      imap.connect();
+    } catch (err) {
+      cleanup();
+      if (!isResolved) {
+        isResolved = true;
+        reject(err);
+      }
+    }
+  }));
 
 /* ───────────────────────── FETCH FULL EMAIL BODY ───────────────────────── */
 const fetchFullEmailByUid = (email, password, uid) =>
-  new Promise((resolve, reject) => {
+  fetchWithRetry(() => new Promise((resolve, reject) => {
     const imap = createImapConnection(email, password);
     let parsed = null;
-    let connectionTimeout;
     let isResolved = false;
 
-    // Add 30 second timeout (increased for cloud environments)
-    connectionTimeout = setTimeout(() => {
+    const timeout = setTimeout(() => {
       if (!isResolved) {
         isResolved = true;
-        imap.end();
-        reject(new Error('Email fetch timeout - IMAP connection took too long'));
+        try { imap.end(); } catch (e) {}
+        reject(new Error('Email fetch timeout'));
       }
-    }, 30000);
+    }, 60000);
 
     const cleanup = () => {
-      clearTimeout(connectionTimeout);
-      if (imap.state !== 'disconnected') {
-        imap.end();
-      }
+      clearTimeout(timeout);
+      try { imap.end(); } catch (e) {}
     };
 
     imap.once('ready', () => {
-      imap.openBox('INBOX', false, (err) => {
+      imap.openBox('INBOX', false, err => {
         if (err) {
           cleanup();
           if (!isResolved) {
             isResolved = true;
-            return reject(new Error(`Failed to open INBOX: ${err.message}`));
+            reject(err);
           }
           return;
         }
@@ -166,7 +234,7 @@ const fetchFullEmailByUid = (email, password, uid) =>
                 cleanup();
                 if (!isResolved) {
                   isResolved = true;
-                  return reject(new Error(`Email parsing failed: ${err.message}`));
+                  reject(err);
                 }
                 return;
               }
@@ -186,25 +254,25 @@ const fetchFullEmailByUid = (email, password, uid) =>
           cleanup();
           if (!isResolved) {
             isResolved = true;
-            parsed ? resolve(parsed) : reject(new Error('Email not found or failed to parse'));
+            parsed ? resolve(parsed) : reject(new Error('Email not found'));
           }
         });
 
-        fetch.once('error', (err) => {
+        fetch.once('error', err => {
           cleanup();
           if (!isResolved) {
             isResolved = true;
-            reject(new Error(`Email fetch failed: ${err.message}`));
+            reject(err);
           }
         });
       });
     });
 
-    imap.once('error', (err) => {
+    imap.once('error', err => {
       cleanup();
       if (!isResolved) {
         isResolved = true;
-        reject(new Error(`IMAP connection error: ${err.message}`));
+        reject(err);
       }
     });
 
@@ -214,57 +282,46 @@ const fetchFullEmailByUid = (email, password, uid) =>
       cleanup();
       if (!isResolved) {
         isResolved = true;
-        reject(new Error(`Failed to connect to IMAP: ${err.message}`));
+        reject(err);
       }
     }
-  });
+  }), 2); // Only 2 retries for single email fetch
 
-/* ───────────────────────── SAVE HEADERS TO DB ───────────────────────── */
+/* ───────────────────────── SAVE TO DATABASE ───────────────────────── */
 const saveEmailsToDatabase = async emails => {
   if (!emails.length) return [];
 
-  // OPTIMIZATION: Batch lookup all existing emails with jobIds in one query
   const messageIds = emails.map(e => e.messageId);
   const existingEmailsWithJobIds = await Email.find({
     messageId: { $in: messageIds },
     jobId: { $exists: true, $ne: null }
   }).select('messageId jobId').lean();
 
-  // Create a Set of messageIds that already have jobIds for fast lookup
   const messageIdsWithJobIds = new Set(existingEmailsWithJobIds.map(e => e.messageId));
 
-  // Build operations based on whether email has existing jobId
   const operations = emails.map(e => {
-    // Create a copy of email data without jobId - we don't want to overwrite it if already linked
-    // isStarred is also a top-level field that might change, so it's included in updates
-    const { jobId, ...emailDataWithoutJobId } = e; // jobId is the only field to potentially preserve
-
-    // The full email data now contains body and attachments from fetchStarredEmails
+    const { jobId, ...emailDataWithoutJobId } = e;
     const fullEmailData = {
-      ...emailDataWithoutJobId, // Includes everything except jobId
+      ...emailDataWithoutJobId,
       body: e.body,
       attachments: e.attachments,
       hasAttachments: e.hasAttachments
     };
 
     if (messageIdsWithJobIds.has(e.messageId)) {
-      // Email is already linked to a ticket - preserve jobId
       return {
         updateOne: {
-          filter: { messageId: e.messageId, workspace: e.workspace }, // Ensure workspace is in filter
-          update: {
-            $set: fullEmailData // Update all other fields, including body and attachments
-          }
+          filter: { messageId: e.messageId, workspace: e.workspace },
+          update: { $set: fullEmailData }
         }
       };
     } else {
-      // New email or email without jobId - set all fields and initialize jobId
       return {
         updateOne: {
-          filter: { messageId: e.messageId, workspace: e.workspace }, // Ensure workspace is in filter
+          filter: { messageId: e.messageId, workspace: e.workspace },
           update: {
-            $set: fullEmailData, // Set all fields, including body, attachments, and isStarred
-            $setOnInsert: { createdAt: new Date(), jobId: null } // Only set these on insert
+            $set: fullEmailData,
+            $setOnInsert: { createdAt: new Date(), jobId: null }
           },
           upsert: true
         }
@@ -273,17 +330,14 @@ const saveEmailsToDatabase = async emails => {
   });
 
   await Email.bulkWrite(operations, { ordered: false });
-
   return emails;
 };
 
-/* ───────────────────────── FETCH BODIES IN PARALLEL ───────────────────────── */
-const fetchEmailBodiesInParallel = async (email, password, list, concurrency = 10) => {
+/* ───────────────────────── OTHER FUNCTIONS ───────────────────────── */
+const fetchEmailBodiesInParallel = async (email, password, list, concurrency = 5) => {
   const results = [];
-
   for (let i = 0; i < list.length; i += concurrency) {
     const batch = list.slice(i, i + concurrency);
-
     const batchRes = await Promise.all(
       batch.map(async e => {
         try {
@@ -295,16 +349,12 @@ const fetchEmailBodiesInParallel = async (email, password, list, concurrency = 1
         }
       })
     );
-
     results.push(...batchRes);
   }
-
   return results;
 };
 
-/* ───────────────────────── UPDATE EMAIL BODY CACHE ───────────────────────── */
 const updateEmailBodies = async results => {
-  // Do updates in parallel (more efficient)
   const updatePromises = results.map(r => {
     if (!r.success) return Promise.resolve(null);
     return Email.findByIdAndUpdate(r.emailId, {
@@ -313,28 +363,24 @@ const updateEmailBodies = async results => {
       hasAttachments: r.attachments.length > 0
     });
   });
-
   const updated = (await Promise.all(updatePromises)).filter(r => r !== null).length;
   return { updated };
 };
 
-/* ───────────────────────── DB READS ───────────────────────── */
 const getStoredEmails = (workspace, limit = 50, skip = 0) =>
   Email.find({ workspace, isStarred: true })
     .sort({ date: -1 })
-    .limit(limit) // Only load first 50 emails for speed
-    .skip(skip) // For pagination
-    .select('_id messageId subject from date hasAttachments isStarred uid threadId') // Only essential fields - NO body or attachments
+    .limit(limit)
+    .skip(skip)
+    .select('_id messageId subject from date hasAttachments isStarred uid threadId')
     .lean();
 
-// Count total emails for pagination
 const getStoredEmailsCount = (workspace) =>
   Email.countDocuments({ workspace, isStarred: true });
 
 const getEmailById = id => Email.findById(id).lean();
 const deleteEmail = id => Email.findByIdAndDelete(id);
 
-/* ───────────────────────── EXPORTS ───────────────────────── */
 module.exports = {
   fetchStarredEmails,
   fetchFullEmailByUid,
