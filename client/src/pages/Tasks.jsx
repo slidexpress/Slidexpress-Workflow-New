@@ -61,6 +61,12 @@ const TASK_GROUPS = {
     label: 'Cancelled',
     bgColor: 'bg-rose-600',
     statuses: ['cancelled']
+  },
+  all: {
+    id: 'all',
+    label: 'All Tasks',
+    bgColor: 'bg-blue-600',
+    statuses: ['not_assigned', 'assigned', 'in_process', 'paused', 'rf_qc', 'qcd', 'file_received', 'sent', 'on_hold', 'tbc', 'cancelled', 'qc_edits']
   }
 };
 
@@ -936,6 +942,7 @@ const Tasks = () => {
   const { user } = useAuth();
   const [tasks, setTasks] = useState([]);
   const [loading, setLoading] = useState(true);
+  const pendingChangesRef = useRef({}); // Track pending changes to preserve during refresh
   const [showEmailModal, setShowEmailModal] = useState(false);
   const [selectedJobId, setSelectedJobId] = useState(null);
   const [selectedTaskId, setSelectedTaskId] = useState(null);
@@ -1046,7 +1053,21 @@ const Tasks = () => {
         // Fetch tasks without showing loading indicator
         teamMemberAPI.getMyTasks()
           .then(response => {
-            setTasks(response.data?.tasks || []);
+            const freshTasks = response.data?.tasks || [];
+            // Merge fresh data with any pending local changes
+            setTasks(prev => {
+              const pending = pendingChangesRef.current;
+              if (Object.keys(pending).length === 0) {
+                return freshTasks;
+              }
+              // Merge pending changes into fresh data
+              return freshTasks.map(task => {
+                if (pending[task._id]) {
+                  return { ...task, ...pending[task._id] };
+                }
+                return task;
+              });
+            });
           })
           .catch(error => {
             console.error('❌ Error auto-refreshing tasks:', error);
@@ -1164,7 +1185,16 @@ const Tasks = () => {
   const getTasksForGroup = (groupId) => {
     const group = TASK_GROUPS[groupId];
     let filtered = tasks.filter(task => group.statuses.includes(task.status));
-
+    
+    // Sort "All Tasks" by most recently assigned (createdAt in descending order)
+    if (groupId === 'all') {
+      filtered = filtered.sort((a, b) => {
+        const dateA = new Date(a.createdAt || 0).getTime();
+        const dateB = new Date(b.createdAt || 0).getTime();
+        return dateB - dateA; // Most recent first
+      });
+    }
+    
     return filtered;
   };
 
@@ -1190,7 +1220,7 @@ const Tasks = () => {
           const missing = [];
           if (!task.meta?.teamEst || task.meta.teamEst.trim() === '') missing.push('• Estimation');
           if (!task.meta?.fileOutput || ((Array.isArray(task.meta.fileOutput) && task.meta.fileOutput.length === 0) || (typeof task.meta.fileOutput === 'string' && task.meta.fileOutput.trim() === ''))) missing.push('• File Output');
-          if (task.meta?.proofread === undefined) missing.push('• Proofread');
+          if (!task.meta?.proofRead || task.meta.proofRead === "") missing.push('• Proofread');
           showError(`Cannot start task. Please fill in the following required fields first:\n\n${missing.join('\n')}`, 'Required Fields Missing');
           return;
         }
@@ -1226,10 +1256,17 @@ const Tasks = () => {
       const payloadMeta = { ...task.meta, fileOutput: values };
       console.log('📦 Payload meta:', payloadMeta);
 
+      // Track pending change to preserve during refresh
+      pendingChangesRef.current[task._id] = { meta: payloadMeta };
+
+      // Update local state immediately
+      setTasks(prev => prev.map(t => t._id === task._id ? { ...t, meta: payloadMeta } : t));
+
       const response = await ticketAPI.updateTicket(task._id, { meta: payloadMeta });
       console.log('✅ Update response:', response);
 
-      setTasks(prev => prev.map(t => t._id === task._id ? { ...t, meta: payloadMeta } : t));
+      // Clear pending change after successful save
+      delete pendingChangesRef.current[task._id];
 
       const displayText = values.length === 0
         ? 'none'
@@ -1238,6 +1275,8 @@ const Tasks = () => {
         : `${values.length} formats`;
       showToast(`File output set to ${displayText}`);
     } catch (error) {
+      // Clear pending change on error too
+      delete pendingChangesRef.current[task._id];
       console.error('❌ Error updating file output:', error);
       console.error('❌ Error response:', error.response?.data);
       console.error('❌ Error message:', error.message);
@@ -1298,15 +1337,26 @@ const Tasks = () => {
 
     try {
       const formattedEst = formatEstimate(hours, minutes);
-      await ticketAPI.updateTicket(taskId, {
-        meta: { ...task.meta, teamEst: formattedEst }
-      });
+      const payloadMeta = { ...task.meta, teamEst: formattedEst };
+
+      // Track pending change to preserve during refresh
+      pendingChangesRef.current[taskId] = { meta: payloadMeta };
+
+      // Update local state immediately
       setTasks(prev => prev.map(t =>
-        t._id === taskId ? { ...t, meta: { ...t.meta, teamEst: formattedEst } } : t
+        t._id === taskId ? { ...t, meta: payloadMeta } : t
       ));
+
+      await ticketAPI.updateTicket(taskId, { meta: payloadMeta });
+
+      // Clear pending change after successful save
+      delete pendingChangesRef.current[taskId];
+
       showToast(`Estimation set to ${formattedEst}`);
       setEstimationModal({ show: false, taskId: null, hours: 0, minutes: '00' });
     } catch (error) {
+      // Clear pending change on error too
+      delete pendingChangesRef.current[taskId];
       console.error('Error updating estimate:', error);
       showError('Failed to update estimate. Please try again.');
     }
@@ -1443,7 +1493,7 @@ const Tasks = () => {
       (Array.isArray(task.meta.fileOutput) && task.meta.fileOutput.length > 0) ||
       (typeof task.meta.fileOutput === 'string' && task.meta.fileOutput.trim() !== '')
     );
-    const hasProofread = task.meta?.proofread !== undefined;
+    const hasProofread = task.meta?.proofRead && task.meta.proofRead !== "";
 
     return hasEstimation && hasFileOutput && hasProofread;
   };
@@ -1512,7 +1562,7 @@ const Tasks = () => {
       const missing = [];
       if (!task.meta?.teamEst || task.meta.teamEst.trim() === '') missing.push('• Estimation');
       if (!task.meta?.fileOutput || ((Array.isArray(task.meta.fileOutput) && task.meta.fileOutput.length === 0) || (typeof task.meta.fileOutput === 'string' && task.meta.fileOutput.trim() === ''))) missing.push('• File Output');
-      if (task.meta?.proofread === undefined) missing.push('• Proofread');
+      if (!task.meta?.proofRead || task.meta.proofRead === "") missing.push('• Proofread');
       showError(`Cannot start task. Please fill in the following required fields first:\n\n${missing.join('\n')}`, 'Required Fields Missing');
       return;
     }
@@ -1626,14 +1676,25 @@ const Tasks = () => {
 
   const handleProofreadChange = async (task, newStatus) => {
     try {
-      const payloadMeta = { ...task.meta, proofread: newStatus };
+      const payloadMeta = { ...task.meta, proofRead: newStatus };
 
-      await ticketAPI.updateTicket(task._id, { meta: payloadMeta });
+      // Track pending change to preserve during refresh
+      pendingChangesRef.current[task._id] = { meta: payloadMeta };
+
+      // Update local state immediately
       setTasks(prev => prev.map(t =>
         t._id === task._id ? { ...t, meta: payloadMeta } : t
       ));
-      showToast(`Task "${task.jobId}" proofread status set to ${newStatus ? 'Yes' : 'No'}`);
+
+      await ticketAPI.updateTicket(task._id, { meta: payloadMeta });
+
+      // Clear pending change after successful save
+      delete pendingChangesRef.current[task._id];
+
+      showToast(`Task "${task.jobId}" proofread status set to ${newStatus || '-'}`);
     } catch (error) {
+      // Clear pending change on error too
+      delete pendingChangesRef.current[task._id];
       console.error('Error updating proofread status:', error);
       showError('Failed to update proofread status. Please try again.');
     }
@@ -2026,6 +2087,9 @@ const Tasks = () => {
         return null;
       })()}
 
+
+
+
       {selectedJob && (
         <TicketDetailsModal
           job={selectedJob}
@@ -2054,7 +2118,8 @@ const Tasks = () => {
           <div className="space-y-3">
             {Object.entries(TASK_GROUPS)
               .filter(([groupId]) => {
-                // Only show groups that have tasks
+                // Exclude the 'all' group and only show groups that have tasks
+                if (groupId === 'all') return false;
                 const groupTasks = getTasksForGroup(groupId);
                 return groupTasks.length > 0;
               })
@@ -2099,17 +2164,19 @@ const Tasks = () => {
                     ) : (
                       <>
                         {/* Table Header */}
-                        <div className="grid-cols-18 grid gap-x-3 px-3 py-1.5 bg-white border-b border-gray-200 text-[12px] font-bold text-gray-700">
+                        <div className={`grid-cols-18 grid gap-x-3 px-3 py-1.5 bg-white border-b border-gray-200 text-[12px] font-bold text-gray-700`}>
                           <span className="col-span-1 truncate">Job ID</span>
-                          <span className="col-span-3 truncate">Client</span>
+                          <span className="col-span-2 truncate">Client</span>
                           <span className="col-span-1 truncate">Client Type</span>
                           <span className="col-span-2 truncate">Consultant</span>
-                          <span className="col-span-2 truncate">Team Members</span>
+                          <span className="col-span-3 truncate">Team Members</span>
                           <span className="col-span-2 truncate">File Output</span>
                           <span className="col-span-1 truncate">Proofread</span>
                           <span className="col-span-2 truncate">Status</span>
                           <span className="col-span-1 truncate">Estimate</span>
-                          <span className="col-span-2 truncate">Deadline</span>
+
+                          <span className={`${groupId === 'all' ? 'col-span-1' : 'col-span-2'} truncate`}>Deadline</span>
+
                           <span className="col-span-1 text-center">Mail</span>
                         </div>
 
@@ -2129,7 +2196,7 @@ const Tasks = () => {
                           return (
                           <div key={task._id}>
                           <div
-                            className={`grid grid-cols-19 gap-x-3 items-center px-3 py-1.5 border-b border-gray-100 transition-all ${
+                            className={`grid grid-cols-18 gap-x-3 items-center px-3 py-1.5 border-b border-gray-100 transition-all ${
                               isActive
                                 ? 'bg-gradient-to-r from-blue-50 to-blue-100 border-l-4 border-l-blue-500 shadow-sm'
                                 : 'hover:bg-gray-50'
@@ -2150,7 +2217,7 @@ const Tasks = () => {
                             </div>
 
                             {/* Client */}
-                            <div className="col-span-3">
+                            <div className="col-span-2">
                               <span className="text-[11px] text-gray-800 font-medium truncate block" title={task.clientName}>
                                 {task.clientName || '-'}
                               </span>
@@ -2201,8 +2268,8 @@ const Tasks = () => {
                             </div>
 
                             {/* Team Members */}
-                            <div className="col-span-2">
-                              <div className="flex flex-wrap gap-1">
+                            <div className="col-span-3">
+                              <div className="flex flex-wrap gap-0.5 items-center">
                                 {(() => {
                                   // Get team members from assignedInfo
                                   const teamMembers = task.assignedInfo?.teamMembers || [];
@@ -2213,7 +2280,7 @@ const Tasks = () => {
                                   const members = teamMembers.length > 0 ? teamMembers : (empName ? [empName] : []);
 
                                   if (members.length === 0) {
-                                    return <span className="text-[11px] text-gray-400">-</span>;
+                                    return <span className="text-[10px] text-gray-400">-</span>;
                                   }
 
                                   // Calculate per-person estimation for tooltip
@@ -2229,17 +2296,22 @@ const Tasks = () => {
                                       : `${member}${timeInfo}`;
 
                                     return (
-                                      <span
+                                      <div
                                         key={idx}
-                                        className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                                        className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium ${
                                           isOwner
-                                            ? 'bg-blue-600 text-white border border-blue-700'
-                                            : 'bg-gray-100 text-gray-700 border border-gray-300'
+                                            ? 'bg-blue-500 text-white'
+                                            : 'bg-gray-500 text-white'
                                         }`}
                                         title={tooltip}
                                       >
-                                        {isOwner && '👤 '}{member}
-                                      </span>
+                                        <span className="truncate max-w-[100px]">{member}</span>
+                                        {isOwner && (
+                                          <span className="inline-flex items-center justify-center w-3.5 h-3.5 rounded-full bg-blue-600 text-white text-[7px] font-bold flex-shrink-0">
+                                            O
+                                          </span>
+                                        )}
+                                      </div>
                                     );
                                   });
                                 })()}
@@ -2260,19 +2332,15 @@ const Tasks = () => {
                             {/* Proofread */}
                             <div className="col-span-1">
                               <ModernDropdown
-                                value={task.meta?.proofread || false}
+                                value={task.meta?.proofRead || ""}
                                 onChange={(value) => handleProofreadChange(task, value)}
                                 options={[
-                                  { label: 'Yes', value: true },
-                                  { label: 'No', value: false }
+                                  { value: "", label: "-" },
+                                  { value: "Yes", label: "Yes" },
+                                  { value: "No", label: "No" }
                                 ]}
-                                placeholder="Select"
-                                width="w-full"
-                                colorClass={
-                                  task.meta?.proofread
-                                    ? 'bg-green-100 text-green-800'
-                                    : 'bg-gray-100 text-gray-600'
-                                }
+                                placeholder="-"
+                                size="small"
                               />
                             </div>
 
@@ -2406,8 +2474,10 @@ const Tasks = () => {
                               )}
                             </div>
 
+
+
                             {/* Deadline */}
-                            <div className="col-span-2">
+                            <div className={groupId === 'all' ? 'col-span-1' : 'col-span-2'}>
                               <span className="text-[11px] text-gray-600 flex items-center gap-1">
                                 {task.meta?.deadline ? (
                                   <>
@@ -2420,46 +2490,7 @@ const Tasks = () => {
                               </span>
                             </div>
 
-                            {/* Actions */}
-                            <div className="col-span-1 flex gap-1.5 justify-center">
-                              {['assigned', 'paused'].includes(task.status) && (
-                                <button
-                                  onClick={() => handleStartTask(task)}
-                                  disabled={!canStartTask(task)}
-                                  className={`px-2 py-1 rounded-lg ${!canStartTask(task) ? 'bg-gray-300 text-gray-600 cursor-not-allowed' : 'bg-green-500 hover:bg-green-600 text-white'} transition-all text-[10px] font-bold`}
-                                  title={!canStartTask(task) ? "Please fill in Estimate, File Output, and Proofread fields first" : (task.status === 'paused' ? 'Resume Task' : 'Start Task')}
-                                >
-                                  {task.status === 'paused' ? 'Resume' : 'Start'}
-                                </button>
-                              )}
-                              {task.status === 'in_process' && (
-                                <>
-                                  <button
-                                    onClick={() => handlePauseTask(task)}
-                                    className="px-1.5 py-1 rounded-lg bg-yellow-500 hover:bg-yellow-600 text-white transition-all text-[10px] font-bold"
-                                    title="Pause Task"
-                                  >
-                                    ⏸
-                                  </button>
-                                  <button
-                                    onClick={() => handleEndTask(task)}
-                                    className="px-1.5 py-1 rounded-lg bg-purple-500 hover:bg-purple-600 text-white transition-all text-[10px] font-bold"
-                                    title="Ready for QC"
-                                  >
-                                    ✓
-                                  </button>
-                                </>
-                              )}
-                              {task.status === 'qcd' && groupId !== 'all' && (
-                                <button
-                                  onClick={() => handleOpenLinkModal(task)}
-                                  className="px-1.5 py-1 rounded-lg bg-cyan-500 hover:bg-cyan-600 text-white transition-all text-[10px] font-bold"
-                                  title="Upload SharePoint Link"
-                                >
-                                  🔗 Link
-                                </button>
-                              )}
-                            </div>
+
 
                             {/* Email */}
                             <div className="col-span-1 flex justify-center items-center gap-1">
