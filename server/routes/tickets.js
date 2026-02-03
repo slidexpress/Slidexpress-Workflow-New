@@ -4,6 +4,7 @@ const Ticket = require('../models/Ticket');
 const Email = require('../models/Email');
 const TeamMember = require('../models/TeamMember');
 const { sendAssignmentEmail } = require('../utils/email');
+const { getNextJobId } = require('../models/JobCounter');
 
 // Helper function to safely convert attachment content to base64
 const contentToBase64 = (content) => {
@@ -123,6 +124,62 @@ router.get('/', async (req, res) => {
 // Create new ticket
 router.post('/', async (req, res) => {
   try {
+    // Helper functions for name cleanup
+    const cleanName = (name) => {
+      if (!name) return '';
+      let cleaned = name.replace(/['"]/g, '').trim();
+      cleaned = cleaned.replace(/<[^>]*>?.*$/, '').trim();
+      cleaned = cleaned.replace(/\s*\(via\s+Google.*\)$/i, '').trim();
+      return cleaned;
+    };
+    const getCompanyFromDomain = (email) => {
+      if (!email) return 'Unknown';
+      const domain = email.split('@')[1];
+      if (!domain) return 'Unknown';
+      let company = domain.split('.')[0];
+      return company.charAt(0).toUpperCase() + company.slice(1);
+    };
+
+    // ⚡ Look up client by email if clientEmail is provided
+    let clientJobCode = 'JOB';  // Default job code prefix
+    if (req.body.clientEmail) {
+      const { findClientByEmail, getClientName, getJobCodeForClient } = require('../models/Client');
+      const client = await findClientByEmail(req.body.clientEmail.toLowerCase());
+
+      if (client) {
+        // Found in database - use database values
+        const dbClientName = getClientName(client);  // Company name from DB
+        const dbConsultantName = client['Consultant Name']?.trim() || '';
+
+        if (dbClientName && dbClientName.trim() !== '' && dbClientName.toLowerCase() !== 'no name') {
+          req.body.clientName = dbClientName.trim();
+        }
+        req.body.consultantName = dbConsultantName;
+
+        // Get Job Code from DB or generate from client name
+        clientJobCode = getJobCodeForClient(client, req.body.clientName);
+
+        // Existing client - no clientType
+        console.log(`✓ Matched: Client="${req.body.clientName}" | Consultant="${req.body.consultantName}" | JobCode="${clientJobCode}"`);
+      } else {
+        // Not in database - sender is consultant, derive company from domain
+        req.body.consultantName = cleanName(req.body.clientName) || '';  // Original name = Consultant
+        req.body.clientName = getCompanyFromDomain(req.body.clientEmail);  // Domain = Company
+        // Generate Job Code from company name
+        const { generateJobCodeFromName } = require('../models/Client');
+        clientJobCode = generateJobCodeFromName(req.body.clientName);
+        // New client - set clientType
+        req.body.meta = req.body.meta || {};
+        req.body.meta.clientType = 'New';
+        console.log(`✗ No match: Client="${req.body.clientName}" (domain) | Consultant="${req.body.consultantName}" (sender) | JobCode="${clientJobCode}" | Type=New`);
+      }
+    }
+
+    // Generate sequential job ID using client's Job Code (e.g., "ABT-001", "ABT-002")
+    // Always generate a new sequential ID from the database
+    req.body.jobId = await getNextJobId(clientJobCode);
+    console.log(`🏷️ Generated sequential jobId: ${req.body.jobId}`);
+
     const ticket = new Ticket(req.body);
 
     // If this ticket was created from an email, populate the emails array
@@ -201,14 +258,9 @@ router.post('/bulk-create', async (req, res) => {
     const createdTickets = [];
     const errors = [];
 
-    // Generate job IDs for each ticket
-    const generateJobId = () => "JOB-" + Math.floor(100000 + Math.random() * 900000);
-
     for (const emailData of emails) {
       let ticketData = null; // Declare outside try block for error logging
       try {
-        const jobId = generateJobId();
-
         // Fetch the source email from database
         const sourceEmail = await Email.findById(emailData._id);
 
@@ -219,6 +271,51 @@ router.post('/bulk-create', async (req, res) => {
         }
 
         console.log(`📧 Processing email: ${sourceEmail.subject} from ${sourceEmail.from?.address || sourceEmail.from?.name || 'Unknown'}`);
+
+        // ⚡ Look up client by sender email
+        const { findClientByEmail, getClientName, getJobCodeForClient, generateJobCodeFromName } = require('../models/Client');
+        const senderEmail = sourceEmail.from?.address?.toLowerCase();
+        const client = senderEmail ? await findClientByEmail(senderEmail) : null;
+
+        // Helper functions
+        const cleanName = (name) => {
+          if (!name) return '';
+          let cleaned = name.replace(/['"]/g, '').trim();
+          cleaned = cleaned.replace(/<[^>]*>?.*$/, '').trim();
+          cleaned = cleaned.replace(/\s*\(via\s+Google.*\)$/i, '').trim();
+          return cleaned;
+        };
+        const getCompanyFromDomain = (email) => {
+          if (!email) return 'Unknown';
+          const domain = email.split('@')[1];
+          if (!domain) return 'Unknown';
+          let company = domain.split('.')[0];
+          return company.charAt(0).toUpperCase() + company.slice(1);
+        };
+
+        // IMPORTANT: Email sender = Consultant, Company = Client
+        let clientName, consultantName, clientType, clientJobCode;
+
+        if (client) {
+          // Found in database - use database values
+          clientName = getClientName(client);  // Company name from DB
+          consultantName = client['Consultant Name']?.trim() || '';
+          // Get Job Code from DB or generate from client name
+          clientJobCode = getJobCodeForClient(client, clientName);
+          clientType = null;  // Existing client
+          console.log(`   ✓ Matched: Client="${clientName}" | Consultant="${consultantName}" | JobCode="${clientJobCode}"`);
+        } else {
+          // Not in database - sender is consultant, derive company from domain
+          consultantName = cleanName(sourceEmail.from?.name) || '';  // Sender = Consultant
+          clientName = getCompanyFromDomain(sourceEmail.from?.address);  // Domain = Company
+          // Generate Job Code from company name (first 3 letters)
+          clientJobCode = generateJobCodeFromName(clientName);
+          clientType = 'New';  // Mark as new client
+          console.log(`   ✗ No match: Client="${clientName}" (domain) | Consultant="${consultantName}" | JobCode="${clientJobCode}" | Type=New`);
+        }
+
+        // Generate sequential job ID with client's Job Code (e.g., "ABT-001", "ABT-002")
+        const jobId = await getNextJobId(clientJobCode);
 
         // Process HTML for inline images
         let processedHtml = sourceEmail.body?.html || null;
@@ -237,13 +334,14 @@ router.post('/bulk-create', async (req, res) => {
         // Create ticket data
         ticketData = {
           jobId,
-          consultantName: "Default Consultant",
-          clientName: sourceEmail.from?.name || sourceEmail.from?.address || 'Unknown',
+          consultantName: consultantName,  // From Client database or sender name
+          clientName: clientName,           // From Client database or domain
           clientEmail: sourceEmail.from?.address || 'unknown@email.com',
           subject: sourceEmail.subject || 'No Subject',
           message: sourceEmail.body?.text || '',
           status: 'not_assigned',
           createdBy: 'System User',
+          meta: { clientType: clientType },  // "New" if not in database
           emails: [{
             _id: sourceEmail._id,
             from: sourceEmail.from?.address || sourceEmail.from?.name || 'Unknown',

@@ -68,4 +68,7 @@ userSchema.methods.comparePassword = async function(candidatePassword) {
   return await bcrypt.compare(candidatePassword, this.password);
 };
 
+// ⚡ INDEX for fast active user lookup (email already indexed via unique:true)
+userSchema.index({ isActive: 1, email: 1 });
+
 module.exports = mongoose.model('User', userSchema);

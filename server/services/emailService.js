@@ -29,18 +29,20 @@ const fetchStarredEmails = (email, password, workspaceId, userId) =>
     const timeout = setTimeout(() => {
       if (!isResolved) {
         isResolved = true;
+        console.log(`⏱️ Timeout - returning ${emails.length} emails`);
         try { imap.end(); } catch (e) {}
-        resolve(emails); // Return what we have so far
+        resolve(emails);
       }
-    }, 60000); // 60 second max
+    }, 120000); // 2 minutes
 
     const cleanup = () => {
       clearTimeout(timeout);
       try { imap.end(); } catch (e) {}
     };
 
+    // Fetch starred emails from last 3 months
     const sinceDate = new Date();
-    sinceDate.setMonth(sinceDate.getMonth() - 1);
+    sinceDate.setMonth(sinceDate.getMonth() - 3);
     const imapSince = sinceDate.toISOString().split('T')[0];
 
     imap.once('ready', () => {
@@ -59,9 +61,8 @@ const fetchStarredEmails = (email, password, workspaceId, userId) =>
             return;
           }
 
-          console.log(`📧 Found ${results.length} starred emails, fetching with body...`);
+          console.log(`📧 Found ${results.length} starred emails, fetching...`);
 
-          // Fetch full email with body for forwarding
           const fetch = imap.fetch(results, { bodies: '', struct: true });
 
           fetch.on('message', msg => {
@@ -83,7 +84,6 @@ const fetchStarredEmails = (email, password, workspaceId, userId) =>
                   return;
                 }
 
-                // Extract all data needed for forwarding
                 emailData.messageId = parsed.headers.get('message-id')?.replace(/[<>]/g, '');
                 emailData.subject = parsed.subject || '(No Subject)';
                 emailData.date = parsed.date || new Date();
@@ -93,26 +93,20 @@ const fetchStarredEmails = (email, password, workspaceId, userId) =>
                   ? { name: from.name || '', address: from.address || '' }
                   : { name: '', address: '' };
 
-                // Get To and CC for forwarding
                 emailData.to = parsed.to?.value || [];
                 emailData.cc = parsed.cc?.value || [];
+                emailData.threadId = parsed.inReplyTo || emailData.messageId;
 
-                emailData.references = parsed.references || [];
-                emailData.threadId = parsed.inReplyTo || emailData.references[0] || emailData.messageId;
-
-                // IMPORTANT: Get body for forwarding
                 emailData.body = {
                   html: parsed.html || '',
                   text: parsed.text || ''
                 };
 
-                // Get attachment metadata (skip content to save space)
                 emailData.attachments = (parsed.attachments || []).map(a => ({
                   filename: a.filename,
                   contentType: a.contentType,
                   size: a.size,
                   contentId: a.contentId
-                  // Skip content to make sync faster
                 }));
                 emailData.hasAttachments = emailData.attachments.length > 0;
 
@@ -128,10 +122,9 @@ const fetchStarredEmails = (email, password, workspaceId, userId) =>
           });
 
           fetch.once('end', () => {
-            // Wait for all parsers to complete
             const checkComplete = () => {
               if (pendingParsers === 0) {
-                console.log(`✅ Synced ${emails.length} emails with body content`);
+                console.log(`✅ Synced ${emails.length}/${results.length} emails`);
                 cleanup();
                 if (!isResolved) { isResolved = true; resolve(emails); }
               } else {

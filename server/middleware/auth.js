@@ -1,7 +1,35 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 
-// Verify JWT token
+// ⚡ FAST: In-memory user cache (5 min TTL)
+const userCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+const getCachedUser = async (userId) => {
+  const cached = userCache.get(userId);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    return cached.user;
+  }
+
+  // Fetch from database
+  const user = await User.findById(userId)
+    .populate('workspace')
+    .populate('teamLead', 'name email role')
+    .lean();
+
+  if (user) {
+    userCache.set(userId, { user, timestamp: Date.now() });
+  }
+
+  return user;
+};
+
+// Clear user from cache (call after user update)
+exports.clearUserCache = (userId) => {
+  userCache.delete(userId.toString());
+};
+
+// Verify JWT token - OPTIMIZED
 exports.authenticate = async (req, res, next) => {
   try {
     const token = req.header('Authorization')?.replace('Bearer ', '');
@@ -11,7 +39,9 @@ exports.authenticate = async (req, res, next) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId).populate('workspace').populate('teamLead', 'name email role');
+
+    // ⚡ FAST: Use cached user data
+    const user = await getCachedUser(decoded.userId);
 
     if (!user || !user.isActive) {
       return res.status(401).json({ message: 'User not found or inactive' });

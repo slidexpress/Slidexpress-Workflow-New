@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 
 const ticketSchema = new mongoose.Schema({
   jobId: { type: String, required: true, unique: true },
-  consultantName: { type: String, required: true },
+  consultantName: { type: String, default: '' },  // Not required - blank if no client match
   clientName: { type: String, required: true },
   clientEmail: { type: String, required: true },
   subject: { type: String, required: true },
@@ -81,7 +81,8 @@ ticketSchema.index({ workspace: 1, createdAt: -1 }); // Fast sorting by creation
 ticketSchema.index({ workspace: 1, assignedTo: 1 }); // Fast filtering by assignee
 ticketSchema.index({ messageId: 1 }); // Fast email lookup
 ticketSchema.index({ status: 1, createdAt: -1 }); // Fast status filtering with sort
-ticketSchema.index({ workspace: 1, messageId: 1 }); // Fast ticket lookup during sync
+// ⚡ UNIQUE INDEX: Prevent duplicate tickets per email message within workspace
+ticketSchema.index({ workspace: 1, messageId: 1 }, { unique: true, sparse: true }); // Unique ticket per email
 ticketSchema.index({ workspace: 1, threadId: 1 }); // Fast thread-based duplicate prevention
 ticketSchema.index({ 'assignedInfo.teamMembers': 1, createdAt: -1 }); // Fast team member tasks lookup
 ticketSchema.index({ 'assignedInfo.empName': 1, createdAt: -1 }); // Fast employee tasks lookup

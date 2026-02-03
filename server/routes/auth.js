@@ -6,7 +6,7 @@ const OTP = require('../models/OTP');
 const { sendOTPEmail } = require('../utils/email');
 const { authenticate } = require('../middleware/auth');
 
-// Login route
+// Login route - OPTIMIZED FOR SPEED
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -16,27 +16,30 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ message: 'Please provide email and password' });
     }
 
-    // Find user
-    const user = await User.findOne({ email }).populate('workspace').populate('teamLead', 'name email role');
+    // ⚡ FAST: Find user with only password field first (no populate)
+    const userBasic = await User.findOne({ email }).select('password isActive isFirstLogin').lean();
 
-    if (!user) {
+    if (!userBasic) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
     // Check if user is active
-    if (!user.isActive) {
+    if (!userBasic.isActive) {
       return res.status(403).json({ message: 'Your account has been deactivated' });
     }
 
-    // Verify password
-    const isMatch = await user.comparePassword(password);
+    // ⚡ FAST: Verify password (this is the slowest part - bcrypt)
+    const isMatch = await require('bcryptjs').compare(password, userBasic.password);
 
     if (!isMatch) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
+    // ⚡ Only fetch full user data AFTER password is verified
+    const user = await User.findById(userBasic._id).populate('workspace').populate('teamLead', 'name email role');
+
     // Check if first login
-    if (user.isFirstLogin) {
+    if (userBasic.isFirstLogin) {
       // DEVELOPMENT MODE: Skip OTP and allow direct password change
       // For production, uncomment the OTP code below and remove this section
 

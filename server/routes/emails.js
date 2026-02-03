@@ -8,416 +8,254 @@ const {
   getStoredEmailsCount,
   getEmailById,
   deleteEmail,
-  fetchEmailBodiesInParallel,
-  updateEmailBodies,
   fetchFullEmailByUid
 } = require('../services/emailService');
 
-// ⚡ SYNC LOCK: Prevent concurrent syncs per workspace
-const syncLocks = new Map(); // workspaceId -> { inProgress: boolean, lastSync: Date }
-const SYNC_COOLDOWN_MS = 30000; // 30 seconds minimum between syncs
+const Ticket = require('../models/Ticket');
+const Email = require('../models/Email');
+const { findClientsByEmails, getClientName } = require('../models/Client');
+const { getNextJobId } = require('../models/JobCounter');
 
-// ─────────────────────────────────────────────
-// SYNC EMAILS – FAST + BODY PREFETCH
-// ─────────────────────────────────────────────
-router.post(
-  '/sync',
-  authenticate,
-  authorize('workflow_coordinator', 'it_admin', 'super_admin'),
-  async (req, res) => {
+// Sync lock per workspace
+const syncLocks = new Map();
+const SYNC_COOLDOWN_MS = 15000;
+
+// Helper to clean up email sender names (remove email part, quotes, etc.)
+const cleanName = (name) => {
+  if (!name) return '';
+  let cleaned = name.replace(/['"]/g, '').trim();
+  cleaned = cleaned.replace(/<[^>]*>?.*$/, '').trim();
+  cleaned = cleaned.replace(/\s*\(via\s+Google.*\)$/i, '').trim();
+  return cleaned;
+};
+
+// Extract company name from email domain
+const getCompanyFromDomain = (email) => {
+  if (!email) return 'Unknown';
+  const domain = email.split('@')[1];
+  if (!domain) return 'Unknown';
+  let company = domain.split('.')[0];
+  company = company.charAt(0).toUpperCase() + company.slice(1);
+  return company;
+};
+
+// ═══════════════════════════════════════════════════════════════
+// SYNC EMAILS - Simple, Fast, No Duplicates
+// ═══════════════════════════════════════════════════════════════
+router.post('/sync', authenticate, authorize('workflow_coordinator', 'it_admin', 'super_admin'), async (req, res) => {
+  const workspaceId = req.user.workspace?._id?.toString();
+  if (!workspaceId) return res.status(400).json({ message: 'Workspace required' });
+
+  // Check sync lock
+  const lock = syncLocks.get(workspaceId) || { busy: false, lastSync: null };
+  if (lock.busy) return res.json({ message: 'Sync in progress', ticketsCreated: 0 });
+  if (lock.lastSync && Date.now() - lock.lastSync < SYNC_COOLDOWN_MS) {
+    return res.json({ message: 'Sync cooldown', ticketsCreated: 0 });
+  }
+
+  syncLocks.set(workspaceId, { busy: true, lastSync: lock.lastSync });
+
+  try {
+    // 1. Fetch starred emails from Gmail
+    const emails = await fetchStarredEmails(
+      process.env.EMAIL_USER,
+      process.env.EMAIL_PASSWORD,
+      req.user.workspace._id,
+      req.user._id
+    );
+
+    if (!emails.length) {
+      syncLocks.set(workspaceId, { busy: false, lastSync: new Date() });
+      return res.json({ message: 'No starred emails', ticketsCreated: 0 });
+    }
+
+    // 2. Save emails to database
+    await saveEmailsToDatabase(emails, req.user.workspace._id);
+
+    // 3. Get client info for all sender emails
+    const validEmails = emails.filter(e => e.messageId?.trim());
+    const senderEmails = [...new Set(validEmails.map(e => e.from?.address?.toLowerCase()).filter(Boolean))];
+    const clients = await findClientsByEmails(senderEmails);
+
+    const clientMap = {};
+    clients.forEach(c => {
+      if (c.Email) clientMap[c.Email.toLowerCase()] = c;
+    });
+
+    // 4. Prepare tickets (MongoDB unique index prevents duplicates)
+    // IMPORTANT: Email sender = Consultant, Company = Client
+    const ticketsToCreate = await Promise.all(validEmails.map(async (e) => {
+      const senderEmail = e.from?.address?.toLowerCase();
+      const client = clientMap[senderEmail];
+
+      let clientName, consultantName, clientType, jobCode;
+      if (client) {
+        // Found in database - use database values
+        clientName = getClientName(client);  // Company name from DB
+        consultantName = client['Consultant Name']?.trim() || '';
+        clientType = null;  // Existing client
+        jobCode = client['Job Code']?.trim() || 'JOB';  // Use client's Job Code
+      } else {
+        // Not in database - sender is consultant, derive company from domain
+        consultantName = cleanName(e.from?.name) || '';  // Sender = Consultant
+        clientName = getCompanyFromDomain(e.from?.address);  // Domain = Company
+        clientType = 'New';  // Mark as new client
+        jobCode = 'JOB';  // Default for unknown clients
+      }
+
+      // Generate sequential Job ID using client's Job Code (e.g., ABT-001, ABT-002)
+      const jobId = await getNextJobId(jobCode);
+
+      return {
+        jobId,
+        clientName,
+        consultantName,
+        clientEmail: e.from.address,
+        subject: e.subject || '(No Subject)',
+        status: 'not_assigned',
+        createdBy: req.user.email,
+        workspace: req.user.workspace._id,
+        messageId: e.messageId,
+        threadId: e.threadId,
+        emailUid: e.uid,
+        createdAt: e.date || new Date(),
+        emailBodyHtml: e.body?.html || '',
+        emailBodyText: e.body?.text || '',
+        message: e.body?.text || e.body?.html || '',
+        attachments: e.attachments || [],
+        hasAttachments: (e.attachments || []).length > 0,
+        meta: { clientType: clientType }  // "New" if not in database
+      };
+    }));
+
+    // 5. Insert tickets - unique index prevents duplicates automatically
+    let created = 0;
     try {
-      if (!req.user.workspace) {
-        return res.status(400).json({ message: 'Workspace required' });
+      const result = await Ticket.insertMany(ticketsToCreate, { ordered: false });
+      created = result.length;
+      console.log(`✅ Created ${created} new tickets`);
+    } catch (err) {
+      // BulkWriteError: some inserted, some were duplicates
+      if (err.code === 11000 || err.insertedDocs) {
+        created = err.insertedDocs?.length || 0;
+        const duplicates = ticketsToCreate.length - created;
+        console.log(`✅ Created ${created} tickets, ${duplicates} already existed`);
+      } else {
+        throw err;
       }
+    }
 
-      const workspaceId = req.user.workspace._id.toString();
+    // 6. Link emails to tickets
+    if (created > 0) {
+      const createdTickets = await Ticket.find({
+        workspace: req.user.workspace._id,
+        messageId: { $in: validEmails.map(e => e.messageId) }
+      }).select('jobId messageId').lean();
 
-      // ⚡ CHECK SYNC LOCK: Prevent concurrent syncs and too-frequent syncs
-      const lockState = syncLocks.get(workspaceId) || { inProgress: false, lastSync: null };
-
-      if (lockState.inProgress) {
-        console.log(`⏳ Sync already in progress for workspace ${workspaceId}, skipping`);
-        return res.json({ message: 'Sync already in progress', emailsFetched: 0, ticketsCreated: 0, cached: true });
-      }
-
-      if (lockState.lastSync && (Date.now() - lockState.lastSync.getTime()) < SYNC_COOLDOWN_MS) {
-        console.log(`⏳ Sync cooldown active for workspace ${workspaceId}, skipping`);
-        return res.json({ message: 'Sync completed recently', emailsFetched: 0, ticketsCreated: 0, cached: true });
-      }
-
-      // Set lock
-      syncLocks.set(workspaceId, { inProgress: true, lastSync: lockState.lastSync });
-
-      const email = process.env.EMAIL_USER;
-      const password = process.env.EMAIL_PASSWORD;
-      if (!email || !password) {
-        syncLocks.set(workspaceId, { inProgress: false, lastSync: lockState.lastSync });
-        return res.status(500).json({ message: 'Email credentials missing' });
-      }
-
-      // 1️⃣ FETCH STARRED EMAIL HEADERS (fast)
-      const emails = await fetchStarredEmails(
-        email,
-        password,
-        req.user.workspace._id,
-        req.user._id
-      );
-
-      // 2️⃣ SAVE HEADERS FIRST (instant response)
-      await saveEmailsToDatabase(emails, req.user.workspace._id);
-
-      // 3️⃣ CREATE TICKETS (optimized with batch queries)
-      let createdTickets = [];
-      try {
-        const Ticket = require('../models/Ticket');
-        const Email = require('../models/Email');
-
-        if (emails.length > 0) {
-          // ⚡ BATCH QUERY 1: Get all existing tickets in ONE query
-          const messageIds = emails.map(e => e.messageId).filter(Boolean);
-          const threadIds = emails.map(e => e.threadId).filter(Boolean);
-
-          const existingTickets = await Ticket.find({
-            workspace: req.user.workspace._id,
-            $or: [
-              { messageId: { $in: messageIds } },
-              { threadId: { $in: threadIds } }
-            ]
-          }).select('messageId threadId').lean();
-
-          const existingMessageIds = new Set(existingTickets.map(t => t.messageId));
-          const existingThreadIds = new Set(existingTickets.map(t => t.threadId));
-
-          // ⚡ BATCH QUERY 2: Get all email docs in ONE query
-          const emailDocs = await Email.find({
-            messageId: { $in: messageIds },
-            workspace: req.user.workspace._id
-          }).lean();
-
-          const emailDocMap = {};
-          emailDocs.forEach(e => { emailDocMap[e.messageId] = e; });
-
-          // Filter emails that need tickets
-          const emailsNeedingTickets = emails.filter(e => {
-            if (existingMessageIds.has(e.messageId) || existingThreadIds.has(e.threadId)) return false;
-            const emailDoc = emailDocMap[e.messageId];
-            if (emailDoc && emailDoc.jobId) return false; // Already linked
-            return true;
-          });
-
-          if (emailsNeedingTickets.length > 0) {
-            // Prepare ticket data in bulk
-            const ticketsToCreate = emailsNeedingTickets.map(e => {
-              const emailDoc = emailDocMap[e.messageId];
-              const ticketData = {
-                jobId: 'JOB-' + Math.floor(100000 + Math.random() * 900000),
-                consultantName: 'Auto-generated',
-                clientName: e.from.name || e.from.address,
-                clientEmail: e.from.address,
-                subject: e.subject || '(No Subject)',
-                status: 'not_assigned',
-                createdBy: req.user.email,
-                workspace: req.user.workspace._id,
-                messageId: e.messageId,
-                threadId: e.threadId,
-                emailUid: e.uid,
-                createdAt: e.date || new Date()
-              };
-
-              if (emailDoc && emailDoc.body) {
-                ticketData.emailBodyHtml = emailDoc.body.html || '';
-                ticketData.emailBodyText = emailDoc.body.text || '';
-                ticketData.message = emailDoc.body.text || emailDoc.body.html || '';
-                ticketData.attachments = emailDoc.attachments || [];
-                ticketData.hasAttachments = (emailDoc.attachments || []).length > 0;
-              }
-
-              return ticketData;
-            });
-
-            // ⚡ BATCH INSERT: Create all tickets at once
-            createdTickets = await Ticket.insertMany(ticketsToCreate, { ordered: false });
-
-            // ⚡ BATCH UPDATE: Link all emails to tickets in ONE operation
-            const emailUpdateOps = createdTickets.map(t => ({
-              updateOne: {
-                filter: { messageId: t.messageId, workspace: req.user.workspace._id },
-                update: { $set: { jobId: t.jobId, isStarred: false } }
-              }
-            }));
-
-            if (emailUpdateOps.length > 0) {
-              await Email.bulkWrite(emailUpdateOps, { ordered: false });
-            }
-
-            console.log(`✅ Created ${createdTickets.length} tickets (batch mode)`);
-          }
+      const bulkOps = createdTickets.map(t => ({
+        updateOne: {
+          filter: { messageId: t.messageId, workspace: req.user.workspace._id },
+          update: { $set: { jobId: t.jobId } }
         }
-      } catch (err) {
-        console.error('⚠️ Ticket creation failed:', err.message);
-      }
+      }));
 
-      // ⚡ RELEASE LOCK and update lastSync timestamp
-      syncLocks.set(workspaceId, { inProgress: false, lastSync: new Date() });
+      if (bulkOps.length) await Email.bulkWrite(bulkOps, { ordered: false });
+    }
 
-      // ⚡ RESPOND NOW - Tickets are created, frontend can fetch them immediately!
-      res.json({
-        message: 'Sync completed',
-        emailsFetched: emails.length,
-        ticketsCreated: createdTickets.length
-      });
+    syncLocks.set(workspaceId, { busy: false, lastSync: new Date() });
+    res.json({ message: 'Sync complete', emailsFetched: emails.length, ticketsCreated: created });
 
-      // 4️⃣ BACKGROUND PROCESSING: Fetch email bodies (non-blocking, user doesn't wait)
+  } catch (err) {
+    syncLocks.set(workspaceId, { busy: false, lastSync: null });
+    console.error('Sync error:', err.message);
+    res.status(500).json({ message: 'Sync failed', error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET ALL EMAILS (paginated)
+// ═══════════════════════════════════════════════════════════════
+router.get('/', authenticate, authorize('workflow_coordinator', 'it_admin', 'super_admin'), async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 0;
+    const limit = parseInt(req.query.limit) || 50;
+
+    const [emails, total] = await Promise.all([
+      getStoredEmails(req.user.workspace._id, limit, page * limit),
+      getStoredEmailsCount(req.user.workspace._id)
+    ]);
+
+    res.json({ emails, pagination: { total, page, limit, pages: Math.ceil(total / limit) } });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to fetch emails', error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET SINGLE EMAIL
+// ═══════════════════════════════════════════════════════════════
+router.get('/:id', authenticate, authorize('workflow_coordinator', 'it_admin', 'super_admin'), async (req, res) => {
+  try {
+    const email = await getEmailById(req.params.id);
+    if (!email) return res.status(404).json({ message: 'Email not found' });
+
+    res.json({ email });
+
+    // Background: fetch body if missing
+    if (email.uid && !email.body?.html) {
       setImmediate(async () => {
         try {
-          const Ticket = require('../models/Ticket');
-          const Email = require('../models/Email');
-
-          // ⚡ OPTIMIZED QUERY: Use indexed field instead of slow $or
-          // Find emails that need bodies - uses compound index {workspace, isStarred, uid}
-          const emailsNeedingBodies = await Email.find({
-            workspace: req.user.workspace._id,
-            isStarred: true,
-            uid: { $ne: null },
-            'body.html': { $in: [null, ''] } // Simpler query, uses index
-          }).select('_id uid messageId').limit(100).lean();
-
-          if (emailsNeedingBodies.length > 0) {
-            console.log(`⚡ BACKGROUND: Fetching ${emailsNeedingBodies.length} email bodies in parallel...`);
-            const startTime = Date.now();
-
-            // Fetch with concurrency limit
-            const fetchResults = await fetchEmailBodiesInParallel(
-              email,
-              password,
-              emailsNeedingBodies,
-              15 // Balanced concurrency - fast but won't overwhelm IMAP
-            );
-
-            const successResults = fetchResults.filter(r => r.success && r.body);
-            const duration = Date.now() - startTime;
-
-            // Update Email collection
-            await updateEmailBodies(fetchResults);
-
-            // ⚡ BATCH UPDATE: Get all messageIds at once, then do single bulkWrite
-            if (successResults.length > 0) {
-              console.log(`⚡ Batch updating ${successResults.length} tickets...`);
-
-              // Get all email docs in ONE query instead of N queries
-              const emailIds = successResults.map(r => r.emailId);
-              const emailDocs = await Email.find({ _id: { $in: emailIds } })
-                .select('_id messageId')
-                .lean();
-
-              // Create map for fast lookup
-              const emailIdToMessageId = {};
-              emailDocs.forEach(e => { emailIdToMessageId[e._id.toString()] = e.messageId; });
-
-              // Build bulk operations
-              const bulkOps = successResults
-                .filter(r => emailIdToMessageId[r.emailId.toString()])
-                .map(result => ({
-                  updateMany: {
-                    filter: { messageId: emailIdToMessageId[result.emailId.toString()] },
-                    update: {
-                      $set: {
-                        emailBodyHtml: result.body.html || '',
-                        emailBodyText: result.body.text || '',
-                        message: result.body.text || result.body.html || '',
-                        attachments: result.attachments || [],
-                        hasAttachments: (result.attachments || []).length > 0
-                      }
-                    }
-                  }
-                }));
-
-              if (bulkOps.length > 0) {
-                await Ticket.bulkWrite(bulkOps, { ordered: false });
-              }
-
-              console.log(`✅ BACKGROUND COMPLETE: Cached ${successResults.length}/${emailsNeedingBodies.length} bodies in ${duration}ms`);
-            }
-          } else {
-            console.log(`✓ All email bodies already cached`);
-          }
-        } catch (err) {
-          console.error('⚠️ Background processing failed:', err.message);
-        }
+          const full = await fetchFullEmailByUid(process.env.EMAIL_USER, process.env.EMAIL_PASSWORD, email.uid);
+          await Email.findByIdAndUpdate(req.params.id, {
+            body: full.body,
+            attachments: full.attachments,
+            hasAttachments: full.attachments?.length > 0
+          });
+        } catch (e) { /* silent */ }
       });
-    } catch (err) {
-      // Release lock on error
-      const workspaceId = req.user?.workspace?._id?.toString();
-      if (workspaceId) {
-        syncLocks.set(workspaceId, { inProgress: false, lastSync: null });
-      }
-      console.error('Sync failed:', err);
-      res.status(500).json({ message: 'Sync failed', error: err.message });
     }
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to fetch email', error: err.message });
   }
-);
+});
 
-// ─────────────────────────────────────────────
-// GET ALL EMAILS (metadata only, fast with pagination)
-// ─────────────────────────────────────────────
-router.get(
-  '/',
-  authenticate,
-  authorize('workflow_coordinator', 'it_admin', 'super_admin'),
-  async (req, res) => {
-    try {
-      const page = parseInt(req.query.page) || 0;
-      const limit = parseInt(req.query.limit) || 50;
-      const skip = page * limit;
+// ═══════════════════════════════════════════════════════════════
+// DOWNLOAD ATTACHMENT
+// ═══════════════════════════════════════════════════════════════
+router.get('/:emailId/attachments/:index', authenticate, authorize('workflow_coordinator', 'it_admin', 'super_admin'), async (req, res) => {
+  try {
+    let email = await getEmailById(req.params.emailId);
+    if (!email) return res.status(404).json({ message: 'Email not found' });
 
-      const [emails, total] = await Promise.all([
-        getStoredEmails(req.user.workspace._id, limit, skip),
-        getStoredEmailsCount(req.user.workspace._id)
-      ]);
-
-      res.json({ 
-        emails,
-        pagination: {
-          total,
-          page,
-          limit,
-          pages: Math.ceil(total / limit)
-        }
-      });
-    } catch (err) {
-      console.error('Error fetching emails:', err);
-      res.status(500).json({ message: 'Failed to fetch emails', error: err.message });
+    // Fetch if attachments missing
+    if (email.hasAttachments && !email.attachments?.length) {
+      const full = await fetchFullEmailByUid(process.env.EMAIL_USER, process.env.EMAIL_PASSWORD, email.uid);
+      await Email.findByIdAndUpdate(email._id, { body: full.body, attachments: full.attachments });
+      email.attachments = full.attachments;
     }
+
+    const att = email.attachments?.[parseInt(req.params.index)];
+    if (!att) return res.status(404).json({ message: 'Attachment not found' });
+
+    const buffer = Buffer.isBuffer(att.content) ? att.content : Buffer.from(att.content?.data || att.content, 'base64');
+    res.setHeader('Content-Type', att.contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(att.filename)}"`);
+    res.send(buffer);
+  } catch (err) {
+    res.status(500).json({ message: 'Download failed', error: err.message });
   }
-);
+});
 
-// ─────────────────────────────────────────────
-// GET SINGLE EMAIL – INSTANT (DB only, no waiting for IMAP)
-// ─────────────────────────────────────────────
-router.get(
-  '/:id',
-  authenticate,
-  authorize('workflow_coordinator', 'it_admin', 'super_admin'),
-  async (req, res) => {
-    try {
-      const email = await getEmailById(req.params.id);
-      if (!email) return res.status(404).json({ message: 'Email not found' });
-
-      // ⚡ INSTANT: Return immediately with whatever we have (cached body or metadata)
-      // No waiting for IMAP - user sees email instantly
-      console.log(`✅ INSTANT: Returning email ${req.params.id}, has body: ${!!email.body?.html}, has UID: ${!!email.uid}`);
-      res.json({ email });
-      
-      // 🔄 BACKGROUND: If body is missing, fetch it asynchronously (non-blocking)
-      if (email.uid && (!email.body || !email.body.html)) {
-        setImmediate(async () => {
-          try {
-            console.log(`⚡ BACKGROUND FETCH: Starting fetch for email ${req.params.id} with UID ${email.uid}`);
-            const { fetchFullEmailByUid } = require('../services/emailService');
-
-            // Try to fetch with a 12-second timeout (increased for reliability)
-            const fullData = await Promise.race([
-              fetchFullEmailByUid(
-                process.env.EMAIL_USER,
-                process.env.EMAIL_PASSWORD,
-                email.uid
-              ),
-              new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('timeout after 12s')), 12000)
-              )
-            ]);
-
-            const Email = require('../models/Email');
-            await Email.findByIdAndUpdate(req.params.id, {
-              body: fullData.body,
-              attachments: fullData.attachments,
-              hasAttachments: fullData.attachments?.length > 0
-            });
-
-            console.log(`✅ BACKGROUND: Successfully cached body for email ${req.params.id}`);
-          } catch (err) {
-            console.error(`⚠️ BACKGROUND fetch failed for ${req.params.id} with UID ${email.uid}:`, err.message);
-            // Silently fail - user already has metadata
-          }
-        });
-      } else if (!email.uid) {
-        console.log(`ℹ️ Email ${req.params.id} has no UID, cannot fetch body from IMAP`);
-      } else {
-        console.log(`ℹ️ Email ${req.params.id} already has cached body`);
-      }
-    } catch (err) {
-      console.error('Error fetching email:', err);
-      res.status(500).json({ message: 'Failed to fetch email', error: err.message });
-    }
-  }
-);
-
-// ─────────────────────────────────────────────
-// DOWNLOAD ATTACHMENT – FAST
-// ─────────────────────────────────────────────
-router.get(
-  '/:emailId/attachments/:index',
-  authenticate,
-  authorize('workflow_coordinator', 'it_admin', 'super_admin'),
-  async (req, res) => {
-    try {
-      const email = await getEmailById(req.params.emailId);
-      if (!email) return res.status(404).json({ message: 'Email not found' });
-
-      // Fetch full email if attachments missing
-      if (email.hasAttachments && (!email.attachments || !email.attachments.length)) {
-        const full = await fetchFullEmailByUid(
-          process.env.EMAIL_USER,
-          process.env.EMAIL_PASSWORD,
-          email.uid
-        );
-
-        const Email = require('../models/Email');
-        await Email.findByIdAndUpdate(email._id, {
-          body: full.body,
-          attachments: full.attachments,
-          hasAttachments: true
-        });
-
-        email.attachments = full.attachments;
-      }
-
-      const attachment = email.attachments[parseInt(req.params.index)];
-      if (!attachment) return res.status(404).json({ message: 'Attachment not found' });
-
-      const buffer = Buffer.isBuffer(attachment.content)
-        ? attachment.content
-        : Buffer.from(attachment.content.data || attachment.content, 'base64');
-
-      res.setHeader('Content-Type', attachment.contentType);
-      res.setHeader(
-        'Content-Disposition',
-        `attachment; filename="${encodeURIComponent(attachment.filename)}"`
-      );
-      res.send(buffer);
-    } catch (err) {
-      console.error('Attachment download failed:', err);
-      res.status(500).json({ message: 'Failed to download attachment', error: err.message });
-    }
-  }
-);
-
-// ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
 // DELETE EMAIL
-// ─────────────────────────────────────────────
-router.delete(
-  '/:id',
-  authenticate,
-  authorize('workflow_coordinator', 'it_admin', 'super_admin'),
-  async (req, res) => {
-    try {
-      await deleteEmail(req.params.id);
-      res.json({ message: 'Email deleted successfully' });
-    } catch (err) {
-      console.error('Delete failed:', err);
-      res.status(500).json({ message: 'Failed to delete email', error: err.message });
-    }
+// ═══════════════════════════════════════════════════════════════
+router.delete('/:id', authenticate, authorize('workflow_coordinator', 'it_admin', 'super_admin'), async (req, res) => {
+  try {
+    await deleteEmail(req.params.id);
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    res.status(500).json({ message: 'Delete failed', error: err.message });
   }
-);
+});
 
 module.exports = router;
